@@ -1,5 +1,5 @@
 # Regularized Neural ODEs (RNODE)
-This repository contains code for reproducing the results in "[How to train your Neural ODE: the world of Jacobian and Kinetic regularization](https://arxiv.org/abs/2002.02798)".
+This repository contains code for reproducing the results in "[How to train your Neural ODE: the world of Jacobian and Kinetic regularization](https://arxiv.org/abs/2002.02798v2)".
 
 ## Requirements
 - PyTorch 1.0+
