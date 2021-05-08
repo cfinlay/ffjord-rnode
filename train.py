@@ -295,7 +295,7 @@ def create_model(args, data_shape, regularization_fns):
         alpha=args.alpha,
         cnf_kwargs={"T": args.time_length, "train_T": args.train_T, "regularization_fns": regularization_fns},
     )
-
+    print("model created ...")
     return model
 
 
