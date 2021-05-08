@@ -281,7 +281,15 @@ def compute_bits_per_dim(x, model):
 def create_model(args, data_shape, regularization_fns):
     hidden_dims = tuple(map(int, args.dims.split(",")))
     strides = tuple(map(int, args.strides.split(",")))
-
+    print("number of blocks: ", args.num_blocks)
+    print("hidden_dims: ", hidden_dims)
+    print("div_samples", args.div_samples)
+    print("strides ", strides)
+    print("squeeze_first ", args.squeeze_first)
+    print("non linearity ", args.nonlinearity)
+    print("layer_type ", args.layer_type)
+    print("zero_last ", args.zero_last)
+    print("alpha ", args.alpha)
     model = odenvp.ODENVP(
         (args.batch_size, *data_shape),
         n_blocks=args.num_blocks,
@@ -335,7 +343,8 @@ def main():
 
     # build model
     regularization_fns, regularization_coeffs = create_regularization_fns(args)
-    model = create_model(args, data_shape, regularization_fns).cuda()
+    model = create_model(args, data_shape, regularization_fns)
+    model = model.cuda()
     if args.distributed: model = dist_utils.DDP(model,
                                                 device_ids=[args.local_rank], 
                                                 output_device=args.local_rank)
