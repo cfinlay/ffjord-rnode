@@ -8,7 +8,6 @@ import yaml, csv
 import shutil
 
 import torch
-torch.cuda.current_device()
 import torch.backends.cudnn as cudnn
 import torch.distributed as distributed
 import torch.nn as nn
@@ -329,7 +328,8 @@ def main():
         if write_log: logger.info("Distributed: success (%d/%d)"%(args.local_rank, distributed.get_world_size()))
 
     # get deivce
-    device = torch.device("cuda:%d"%torch.cuda.current_device() if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cuda:%d"%torch.cuda.current_device() if torch.cuda.is_available() else "cpu")
+    device = "cpu"
     cvt = lambda x: x.type(torch.float32).to(device, non_blocking=True)
 
     # load dataset
@@ -344,7 +344,7 @@ def main():
     # build model
     regularization_fns, regularization_coeffs = create_regularization_fns(args)
     model = create_model(args, data_shape, regularization_fns)
-    model = model.cuda()
+    # model = model.cuda()
     if args.distributed: model = dist_utils.DDP(model,
                                                 device_ids=[args.local_rank], 
                                                 output_device=args.local_rank)
@@ -464,9 +464,9 @@ def main():
                                             bpd.item(),
                                             nfe_opt,
                                             grad_norm,
-                                            *reg_states]).float().cuda()
+                                            *reg_states]).float()
 
-                    rv = tuple(torch.tensor(0.).cuda() for r in reg_states)
+                    rv = tuple(torch.tensor(0.)for r in reg_states)
 
                     total_gpus, batch_total, r_loss, r_bpd, r_nfe, r_grad_norm, *rv = dist_utils.sum_tensor(metrics).cpu().numpy()
 
@@ -556,7 +556,7 @@ def main():
 
 
                     loss = lossmean.item()
-                    metrics = torch.tensor([1., loss, meandist, steps]).float().cuda()
+                    metrics = torch.tensor([1., loss, meandist, steps]).float()
 
                     total_gpus, r_bpd, r_mdist, r_steps = dist_utils.sum_tensor(metrics).cpu().numpy()
                     eval_time = time.time()-start
