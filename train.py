@@ -8,6 +8,7 @@ import yaml, csv
 import shutil
 
 import torch
+torch.cuda.current_device()
 import torch.backends.cudnn as cudnn
 import torch.distributed as distributed
 import torch.nn as nn
@@ -289,7 +290,6 @@ def create_model(args, data_shape, regularization_fns):
     print("non linearity ", args.nonlinearity)
     print("layer_type ", args.layer_type)
     print("zero_last ", args.zero_last)
-    print("alpha ", args.alpha)
     model = odenvp.ODENVP(
         (args.batch_size, *data_shape),
         n_blocks=args.num_blocks,
