@@ -1,0 +1,1001 @@
+/HPS/CNF/work/ffjord-rnode/train.py
+import argparse
+import os, sys
+import warnings
+import pandas as pd
+import time
+import numpy as np
+import yaml, csv
+import shutil
+
+import torch
+import torch.backends.cudnn as cudnn
+import torch.distributed as distributed
+import torch.nn as nn
+import torch.optim as optim
+
+import torchvision.datasets as dset
+import torchvision.transforms as tforms
+from torchvision.utils import save_image
+
+import lib.layers as layers
+import lib.utils as utils
+import lib.odenvp as odenvp
+from lib.datasets import CelebAHQ, Imagenet64
+
+from train_misc import standard_normal_logprob
+from train_misc import set_cnf_options, count_nfe, count_parameters, count_total_time
+from train_misc import create_regularization_fns, get_regularization, append_regularization_to_log
+from train_misc import append_regularization_keys_header, append_regularization_csv_dict
+
+import dist_utils
+from dist_utils import env_world_size, env_rank
+from torch.utils.data.distributed import DistributedSampler
+
+SOLVERS = ["dopri5", "bdf", "rk4", "midpoint", 'adams', 'explicit_adams', 'adaptive_heun', 'bosh3']
+
+def get_parser():
+    parser = argparse.ArgumentParser("Continuous Normalizing Flow")
+    parser.add_argument("--datadir", default="./data/")
+    parser.add_argument("--nworkers", type=int, default=4)
+    parser.add_argument("--data", choices=["mnist", "svhn", "cifar10", 'lsun_church', 'celebahq', 'imagenet64'], 
+            type=str, default="mnist")
+    parser.add_argument("--dims", type=str, default="64,64,64")
+    parser.add_argument("--strides", type=str, default="1,1,1,1")
+    parser.add_argument("--num_blocks", type=int, default=2, help='Number of stacked CNFs.')
+
+    parser.add_argument(
+        "--layer_type", type=str, default="concat",
+        choices=["ignore", "concat"]
+    )
+    parser.add_argument("--divergence_fn", type=str, default="approximate", choices=["brute_force", "approximate"])
+    parser.add_argument(
+        "--nonlinearity", type=str, default="softplus", choices=["tanh", "relu", "softplus", "elu"]
+    )
+    parser.add_argument('--solver', type=str, default='dopri5', choices=SOLVERS)
+    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'sgd'])
+    parser.add_argument('--atol', type=float, default=1e-5, help='only for adaptive solvers')
+    parser.add_argument('--rtol', type=float, default=1e-5,  help='only for adaptive solvers')
+    parser.add_argument('--step_size', type=float, default=0.25, help='only for fixed step size solvers')
+    parser.add_argument('--first_step', type=float, default=0.166667, help='only for adaptive solvers')
+
+    parser.add_argument('--test_solver', type=str, default=None, choices=SOLVERS + [None])
+    parser.add_argument('--test_atol', type=float, default=None)
+    parser.add_argument('--test_rtol', type=float, default=None)
+    parser.add_argument('--test_step_size', type=float, default=None)
+    parser.add_argument('--test_first_step', type=float, default=None)
+
+    parser.add_argument("--imagesize", type=int, default=None)
+    parser.add_argument("--alpha", type=float, default=1e-6)
+    parser.add_argument('--time_length', type=float, default=1.0)
+    parser.add_argument('--train_T', type=eval, default=False)
+
+    parser.add_argument("--num_epochs", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=200)
+    parser.add_argument(
+        "--batch_size_schedule", type=str, default="", help="Increases the batchsize at every given epoch, dash separated."
+    )
+    parser.add_argument("--test_batch_size", type=int, default=200)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--warmup_iters", type=float, default=1000)
+    parser.add_argument("--weight_decay", type=float, default=0.)
+
+    parser.add_argument("--add_noise", type=eval, default=True, choices=[True, False])
+    parser.add_argument('--nbits', type=int, default=8)
+    parser.add_argument('--div_samples',type=int, default=1)
+    parser.add_argument('--squeeze_first', type=eval, default=False, choices=[True, False])
+    parser.add_argument('--zero_last', type=eval, default=True, choices=[True, False])
+    parser.add_argument('--seed', type=int, default=42)
+
+    # Regularizations
+    parser.add_argument('--kinetic-energy', type=float, default=None, help="int_t ||f||_2^2")
+    parser.add_argument('--jacobian-norm2', type=float, default=None, help="int_t ||df/dx||_F^2")
+    parser.add_argument('--total-deriv', type=float, default=None, help="int_t ||df/dt||^2")
+    parser.add_argument('--directional-penalty', type=float, default=None, help="int_t ||(df/dx)^T f||^2")
+
+    parser.add_argument(
+        "--max_grad_norm", type=float, default=np.inf,
+        help="Max norm of graidents"
+    )
+
+    parser.add_argument("--resume", type=str, default=None, help='path to saved check point')
+    parser.add_argument("--save", type=str, default="experiments/cnf")
+    parser.add_argument("--val_freq", type=int, default=1)
+    parser.add_argument("--log_freq", type=int, default=10)
+    parser.add_argument('--validate', type=eval, default=False, choices=[True, False])
+
+    parser.add_argument('--distributed', action='store_true', help='Run distributed training. Default True')
+    parser.add_argument('--dist-url', default='env://', type=str,
+                        help='url used to set up distributed training')
+    parser.add_argument('--dist-backend', default='nccl', type=str, help='distributed backend')
+    parser.add_argument('--local_rank', default=0, type=int,
+                        help='Used for multi-process training. Can either be manually set ' +
+                        'or automatically set by using \'python -m multiproc\'.')
+
+    #parser.add_argument('--skip-auto-shutdown', action='store_true',
+    #                    help='Shutdown instance at the end of training or failure')
+    #parser.add_argument('--auto-shutdown-success-delay-mins', default=10, type=int,
+    #                    help='how long to wait until shutting down on success')
+    #parser.add_argument('--auto-shutdown-failure-delay-mins', default=60, type=int,
+    #                    help='how long to wait before shutting down on error')
+
+    return parser
+
+cudnn.benchmark = True
+args = get_parser().parse_args()
+torch.manual_seed(args.seed)
+nvals = 2**args.nbits
+
+# Only want master rank logging
+is_master = (not args.distributed) or (dist_utils.env_rank()==0)
+is_rank0 = args.local_rank == 0
+write_log = is_rank0 and is_master
+
+
+def add_noise(x, nbits=8):
+    if nbits<8:
+        x = x // (2**(8-nbits))
+    if args.add_noise:
+        noise = x.new().resize_as_(x).uniform_()
+    else:
+        noise = 1/2
+    return x.add_(noise).div_(2**nbits)
+
+def shift(x, nbits=8):
+    if nbits<8:
+        x = x // (2**(8-nbits))
+
+    return x.add_(1/2).div_(2**nbits)
+
+def unshift(x, nbits=8):
+    return x.add_(-1/(2**(nbits+1)))
+
+
+def update_lr(optimizer, itr):
+    iter_frac = min(float(itr + 1) / max(args.warmup_iters, 1), 1.0)
+    lr = args.lr * iter_frac
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+
+
+
+def get_dataset(args):
+    trans = lambda im_size: tforms.Compose([tforms.Resize(im_size)])
+
+    if args.data == "mnist":
+        im_dim = 1
+        im_size = 28 if args.imagesize is None else args.imagesize
+        train_set = dset.MNIST(root=args.datadir, train=True, transform=trans(im_size), download=True)
+        test_set = dset.MNIST(root=args.datadir, train=False, transform=trans(im_size), download=True)
+    elif args.data == "svhn":
+        im_dim = 3
+        im_size = 32 if args.imagesize is None else args.imagesize
+        train_set = dset.SVHN(root=args.datadir, split="train", transform=trans(im_size), download=True)
+        test_set = dset.SVHN(root=args.datadir, split="test", transform=trans(im_size), download=True)
+    elif args.data == "cifar10":
+        im_dim = 3
+        im_size = 32 if args.imagesize is None else args.imagesize
+        train_set = dset.CIFAR10(
+            root=args.datadir, train=True, transform=tforms.Compose([
+                tforms.Resize(im_size),
+                tforms.RandomHorizontalFlip(),
+            ]), download=True
+        )
+        test_set = dset.CIFAR10(root=args.datadir, train=False, transform=None, download=True)
+    elif args.data == 'celebahq':
+        im_dim = 3
+        im_size = 256 if args.imagesize is None else args.imagesize
+        train_set = CelebAHQ(
+            train=True, root=args.datadir, transform=tforms.Compose([
+                tforms.ToPILImage(),
+                tforms.Resize(im_size),
+                tforms.RandomHorizontalFlip(),
+            ])
+        )
+        test_set = CelebAHQ(
+            train=False, root=args.datadir,  transform=tforms.Compose([
+                tforms.ToPILImage(),
+                tforms.Resize(im_size),
+            ])
+        )
+    elif args.data == 'imagenet64':
+        im_dim = 3
+        if args.imagesize != 64:
+            args.imagesize = 64
+        im_size = 64
+        train_set = Imagenet64(train=True, root=args.datadir)
+        test_set = Imagenet64(train=False, root=args.datadir)
+    elif args.data == 'lsun_church':
+        im_dim = 3
+        im_size = 64 if args.imagesize is None else args.imagesize
+        train_set = dset.LSUN(
+            'data', ['church_outdoor_train'], transform=tforms.Compose([
+                tforms.Resize(96),
+                tforms.RandomCrop(64),
+                tforms.Resize(im_size),
+            ])
+        )
+        test_set = dset.LSUN(
+            'data', ['church_outdoor_val'], transform=tforms.Compose([
+                tforms.Resize(96),
+                tforms.RandomCrop(64),
+                tforms.Resize(im_size),
+            ])
+        )
+    data_shape = (im_dim, im_size, im_size)
+
+    def fast_collate(batch):
+
+        imgs = [img[0] for img in batch]
+        targets = torch.tensor([target[1] for target in batch], dtype=torch.int64)
+        w = imgs[0].size[0]
+        h = imgs[0].size[1]
+
+        tensor = torch.zeros( (len(imgs), im_dim, im_size, im_size), dtype=torch.uint8 )
+        for i, img in enumerate(imgs):
+            nump_array = np.asarray(img, dtype=np.uint8)
+            tens = torch.from_numpy(nump_array)
+            if(nump_array.ndim < 3):
+                nump_array = np.expand_dims(nump_array, axis=-1)
+            nump_array = np.rollaxis(nump_array, 2)
+            tensor[i] += torch.from_numpy(nump_array)
+
+        return tensor, targets
+
+    train_sampler = (DistributedSampler(train_set,
+        num_replicas=env_world_size(), rank=env_rank()) if args.distributed
+        else None)
+
+    train_loader = torch.utils.data.DataLoader(
+        dataset=train_set, batch_size=args.batch_size, #shuffle=True,
+        num_workers=args.nworkers, pin_memory=True, sampler=train_sampler, collate_fn=fast_collate
+    )
+
+    test_sampler = (DistributedSampler(test_set,
+        num_replicas=env_world_size(), rank=env_rank(), shuffle=False) if args.distributed
+        else None)
+
+    test_loader = torch.utils.data.DataLoader(
+        dataset=test_set, batch_size=args.test_batch_size, #shuffle=False,
+        num_workers=args.nworkers, pin_memory=True, sampler=test_sampler, collate_fn=fast_collate
+    )
+
+    return train_loader, test_loader, data_shape
+
+
+def compute_bits_per_dim(x, model):
+    zero = torch.zeros(x.shape[0], 1).to(x)
+
+    z, delta_logp, reg_states = model(x, zero)  # run model forward
+
+    reg_states = tuple(torch.mean(rs) for rs in reg_states)
+
+    logpz = standard_normal_logprob(z).view(z.shape[0], -1).sum(1, keepdim=True)  # logp(z)
+    logpx = logpz - delta_logp
+
+    logpx_per_dim = torch.sum(logpx) / x.nelement()  # averaged over batches
+    bits_per_dim = -(logpx_per_dim - np.log(nvals)) / np.log(2)
+
+    return bits_per_dim, (x, z), reg_states
+
+
+def create_model(args, data_shape, regularization_fns):
+    hidden_dims = tuple(map(int, args.dims.split(",")))
+    strides = tuple(map(int, args.strides.split(",")))
+
+    model = odenvp.ODENVP(
+        (args.batch_size, *data_shape),
+        n_blocks=args.num_blocks,
+        intermediate_dims=hidden_dims,
+        div_samples=args.div_samples,
+        strides=strides,
+        squeeze_first=args.squeeze_first,
+        nonlinearity=args.nonlinearity,
+        layer_type=args.layer_type,
+        zero_last=args.zero_last,
+        alpha=args.alpha,
+        cnf_kwargs={"T": args.time_length, "train_T": args.train_T, "regularization_fns": regularization_fns},
+    )
+
+    return model
+
+
+#if __name__ == "__main__":
+def main():
+    #os.system('shutdown -c')  # cancel previous shutdown command
+
+    if write_log:
+        utils.makedirs(args.save)
+        logger = utils.get_logger(logpath=os.path.join(args.save, 'logs'), filepath=os.path.abspath(__file__))
+
+        logger.info(args)
+
+        args_file_path = os.path.join(args.save, 'args.yaml')
+        with open(args_file_path, 'w') as f:
+            yaml.dump(vars(args), f, default_flow_style=False)
+
+    if args.distributed:
+        if write_log: logger.info('Distributed initializing process group')
+        torch.cuda.set_device(args.local_rank)
+        distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url, world_size=dist_utils.env_world_size(), rank=env_rank())
+        assert(dist_utils.env_world_size() == distributed.get_world_size())
+        if write_log: logger.info("Distributed: success (%d/%d)"%(args.local_rank, distributed.get_world_size()))
+
+    # get deivce
+    device = torch.device("cuda:%d"%torch.cuda.current_device() if torch.cuda.is_available() else "cpu")
+    cvt = lambda x: x.type(torch.float32).to(device, non_blocking=True)
+
+    # load dataset
+    train_loader, test_loader, data_shape = get_dataset(args)
+
+    trainlog = os.path.join(args.save,'training.csv')
+    testlog = os.path.join(args.save,'test.csv')
+
+    traincolumns = ['itr','wall','itr_time','loss','bpd','fe','total_time','grad_norm']
+    testcolumns = ['wall','epoch','eval_time','bpd','fe', 'total_time', 'transport_cost']
+
+    # build model
+    regularization_fns, regularization_coeffs = create_regularization_fns(args)
+    model = create_model(args, data_shape, regularization_fns).cuda()
+    if args.distributed: model = dist_utils.DDP(model,
+                                                device_ids=[args.local_rank], 
+                                                output_device=args.local_rank)
+
+    traincolumns = append_regularization_keys_header(traincolumns, regularization_fns)
+
+    if not args.resume and write_log:
+        with open(trainlog,'w') as f:
+            csvlogger = csv.DictWriter(f, traincolumns)
+            csvlogger.writeheader()
+        with open(testlog,'w') as f:
+            csvlogger = csv.DictWriter(f, testcolumns)
+            csvlogger.writeheader()
+
+    set_cnf_options(args, model)
+
+    if write_log: logger.info(model)
+    if write_log: logger.info("Number of trainable parameters: {}".format(count_parameters(model)))
+    if write_log: logger.info('Iters per train epoch: {}'.format(len(train_loader)))
+    if write_log: logger.info('Iters per test: {}'.format(len(test_loader)))
+
+    # optimizer
+    if args.optimizer=='adam':
+        optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    elif args.optimizer=='sgd':
+        optimizer = optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, momentum=0.9,
+                nesterov=False)
+
+    # restore parameters
+    if args.resume is not None:
+        checkpt = torch.load(args.resume, map_location = lambda storage, loc: storage.cuda(args.local_rank))
+        model.load_state_dict(checkpt["state_dict"])
+        if "optim_state_dict" in checkpt.keys():
+            optimizer.load_state_dict(checkpt["optim_state_dict"])
+            # Manually move optimizer state to device.
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if torch.is_tensor(v):
+                        state[k] = cvt(v)
+
+
+    # For visualization.
+    if write_log: fixed_z = cvt(torch.randn(min(args.test_batch_size,100), *data_shape))
+
+    if write_log:
+        time_meter = utils.RunningAverageMeter(0.97)
+        bpd_meter = utils.RunningAverageMeter(0.97)
+        loss_meter = utils.RunningAverageMeter(0.97)
+        steps_meter = utils.RunningAverageMeter(0.97)
+        grad_meter = utils.RunningAverageMeter(0.97)
+        tt_meter = utils.RunningAverageMeter(0.97)
+
+
+    if not args.resume:
+        best_loss = float("inf")
+        itr = 0
+        wall_clock = 0.
+        begin_epoch = 1
+    else:
+        chkdir = os.path.dirname(args.resume)
+        tedf = pd.read_csv(os.path.join(chkdir,'test.csv'))
+        trdf = pd.read_csv(os.path.join(chkdir,'training.csv'))
+        wall_clock = trdf['wall'].to_numpy()[-1]
+        itr = trdf['itr'].to_numpy()[-1]
+        best_loss = tedf['bpd'].min()
+        begin_epoch = int(tedf['epoch'].to_numpy()[-1]+1) # not exactly correct
+
+    if args.distributed:
+        if write_log: logger.info('Syncing machines before training')
+        dist_utils.sum_tensor(torch.tensor([1.0]).float().cuda())
+    
+
+    for epoch in range(begin_epoch, args.num_epochs + 1):
+        if not args.validate:
+            model.train()
+
+            with open(trainlog,'a') as f:
+                if write_log: csvlogger = csv.DictWriter(f, traincolumns)
+
+                for _, (x, y) in enumerate(train_loader):
+                    start = time.time()
+                    update_lr(optimizer, itr)
+                    optimizer.zero_grad()
+
+                    # cast data and move to device
+                    x = add_noise(cvt(x), nbits=args.nbits)
+                    #x = x.clamp_(min=0, max=1)
+                    # compute loss
+                    bpd, (x, z), reg_states = compute_bits_per_dim(x, model)
+                    if np.isnan(bpd.data.item()):
+                        raise ValueError('model returned nan during training')
+                    elif np.isinf(bpd.data.item()):
+                        raise ValueError('model returned inf during training')
+                    
+                    loss = bpd
+                    if regularization_coeffs:
+                        reg_loss = sum(
+                            reg_state * coeff for reg_state, coeff in zip(reg_states, regularization_coeffs) if coeff != 0
+                        )
+                        loss = loss + reg_loss
+                    total_time = count_total_time(model)
+
+                    loss.backward()
+                    nfe_opt = count_nfe(model)
+                    if write_log: steps_meter.update(nfe_opt)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+                    optimizer.step()
+
+
+                    itr_time = time.time() - start
+                    wall_clock += itr_time
+                    
+                    batch_size = x.size(0)
+                    metrics = torch.tensor([1., batch_size,
+                                            loss.item(),
+                                            bpd.item(),
+                                            nfe_opt,
+                                            grad_norm,
+                                            *reg_states]).float().cuda()
+
+                    rv = tuple(torch.tensor(0.).cuda() for r in reg_states)
+
+                    total_gpus, batch_total, r_loss, r_bpd, r_nfe, r_grad_norm, *rv = dist_utils.sum_tensor(metrics).cpu().numpy()
+
+
+                    
+                    if write_log:
+                        time_meter.update(itr_time)
+                        bpd_meter.update(r_bpd/total_gpus)
+                        loss_meter.update(r_loss/total_gpus)
+                        grad_meter.update(r_grad_norm/total_gpus)
+                        tt_meter.update(total_time)
+
+                        fmt = '{:.4f}'
+                        logdict = {'itr':itr, 
+                            'wall': fmt.format(wall_clock),
+                            'itr_time': fmt.format(itr_time),
+                            'loss': fmt.format(r_loss/total_gpus),
+                            'bpd': fmt.format(r_bpd/total_gpus),
+                            'total_time':fmt.format(total_time),
+                            'fe': r_nfe/total_gpus,
+                            'grad_norm': fmt.format(r_grad_norm/total_gpus),
+                            }
+                        if regularization_coeffs:
+                            rv = tuple(v_/total_gpus for v_ in rv)
+                            logdict = append_regularization_csv_dict(logdict,
+                                    regularization_fns, rv)
+                        csvlogger.writerow(logdict)
+
+                        if itr % args.log_freq == 0:
+                            log_message = (
+                                    "Itr {:06d} | Wall {:.3e}({:.2f}) | "
+                                    "Time/Itr {:.2f}({:.2f}) | BPD {:.2f}({:.2f}) | "
+                                    "Loss {:.2f}({:.2f}) | "
+                                    "FE {:.0f}({:.0f}) | Grad Norm {:.3e}({:.3e}) | "
+                                    "TT {:.2f}({:.2f})".format(
+                                    itr, wall_clock, wall_clock/(itr+1), 
+                                    time_meter.val, time_meter.avg,
+                                    bpd_meter.val, bpd_meter.avg,
+                                    loss_meter.val, loss_meter.avg,
+                                    steps_meter.val, steps_meter.avg,
+                                    grad_meter.val, grad_meter.avg, 
+                                    tt_meter.val, tt_meter.avg
+                                    )
+                                )
+                            if regularization_coeffs:
+                                log_message = append_regularization_to_log(log_message,
+                                        regularization_fns, rv)
+                            logger.info(log_message)
+
+
+
+                    itr += 1
+
+        # compute test loss
+        model.eval()
+        if args.local_rank==0:
+            utils.makedirs(args.save)
+            torch.save({
+                "args": args,
+                "state_dict": model.module.state_dict() if torch.cuda.is_available() else model.state_dict(),
+                "optim_state_dict": optimizer.state_dict(), 
+                "fixed_z": fixed_z.cpu()
+            }, os.path.join(args.save, "checkpt.pth"))
+        if epoch % args.val_freq == 0 or args.validate:
+            with open(testlog,'a') as f:
+                if write_log: csvlogger = csv.DictWriter(f, testcolumns)
+                with torch.no_grad():
+                    start = time.time()
+                    if write_log: logger.info("validating...")
+
+
+                    lossmean = 0.
+                    meandist = 0.
+                    steps = 0
+                    tt = 0.
+                    for i, (x, y) in enumerate(test_loader):
+                        sh = x.shape
+                        x = shift(cvt(x), nbits=args.nbits)
+                        loss, (x,z), _ = compute_bits_per_dim(x, model)
+                        dist = (x.view(x.size(0),-1)-z).pow(2).mean(dim=-1).mean()
+                        meandist = i/(i+1)*dist + meandist/(i+1)
+                        lossmean = i/(i+1)*lossmean + loss/(i+1) 
+
+                        tt = i/(i+1)*tt + count_total_time(model)/(i+1)
+                        steps = i/(i+1)*steps + count_nfe(model)/(i+1)
+
+
+
+                    loss = lossmean.item()
+                    metrics = torch.tensor([1., loss, meandist, steps]).float().cuda()
+
+                    total_gpus, r_bpd, r_mdist, r_steps = dist_utils.sum_tensor(metrics).cpu().numpy()
+                    eval_time = time.time()-start
+
+                    if write_log:
+                        fmt = '{:.4f}'
+                        logdict = {'epoch':epoch,
+                                   'eval_time':fmt.format(eval_time),
+                                   'bpd':fmt.format(r_bpd/total_gpus),
+                                   'wall': fmt.format(wall_clock),
+                                   'total_time':fmt.format(tt),
+                                   'transport_cost':fmt.format(r_mdist/total_gpus),
+                                   'fe':'{:.2f}'.format(r_steps/total_gpus)}
+
+                        csvlogger.writerow(logdict)
+
+                        logger.info("Epoch {:04d} | Time {:.4f}, Bit/dim {:.4f}, Steps {:.4f}, TT {:.2f}, Transport Cost {:.2e}".format(epoch, eval_time, r_bpd/total_gpus, r_steps/total_gpus, tt, r_mdist/total_gpus))
+
+                    loss = r_bpd/total_gpus
+
+
+                    if loss < best_loss and args.local_rank==0: 
+                        best_loss = loss
+                        shutil.copyfile(os.path.join(args.save, "checkpt.pth"),
+                                        os.path.join(args.save, "best.pth"))
+
+
+
+            # visualize samples and density
+            if write_log:
+                with torch.no_grad():
+                    fig_filename = os.path.join(args.save, "figs", "{:04d}.jpg".format(epoch))
+                    utils.makedirs(os.path.dirname(fig_filename))
+                    generated_samples, _, _ = model(fixed_z, reverse=True)
+                    generated_samples = generated_samples.view(-1, *data_shape)
+                    nb = int(np.ceil(np.sqrt(float(fixed_z.size(0)))))
+                    save_image(unshift(generated_samples, nbits=args.nbits), fig_filename, nrow=nb)
+            if args.validate:
+                break
+
+if __name__ == '__main__':
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            main()
+        #if not args.skip_auto_shutdown: os.system(f'sudo shutdown -h -P +{args.auto_shutdown_success_delay_mins}')
+    except Exception as e:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        import traceback
+        traceback.print_tb(exc_traceback, file=sys.stdout)
+        # in case of exception, wait 2 hours before shutting down
+        #if not args.skip_auto_shutdown: os.system(f'sudo shutdown -h -P +{args.auto_shutdown_failure_delay_mins}')
+
+Namespace(add_noise=True, alpha=1e-05, atol=1e-05, batch_size=200, batch_size_schedule='', data='mnist', datadir='../data/', dims='64,64,64', directional_penalty=None, dist_backend='nccl', dist_url='env://', distributed=True, div_samples=1, divergence_fn='approximate', first_step=0.166667, imagesize=None, jacobian_norm2=0.01, kinetic_energy=0.01, layer_type='concat', local_rank=0, log_freq=10, lr=0.001, max_grad_norm=inf, nbits=8, nonlinearity='softplus', num_blocks=2, num_epochs=100, nworkers=4, optimizer='adam', resume=None, rtol=1e-05, save='../experiments/mnist/example/', seed=42, solver='rk4', squeeze_first=False, step_size=0.25, strides='1,1,1,1', test_atol=1e-05, test_batch_size=200, test_first_step=None, test_rtol=1e-05, test_solver='dopri5', test_step_size=None, time_length=1.0, total_deriv=None, train_T=False, val_freq=1, validate=False, warmup_iters=1000, weight_decay=0.0, zero_last=True)
+Distributed initializing process group
+Added key: store_based_barrier_key:1 to store for rank: 0
+Distributed: success (0/1)
+DDP(
+  (module): ODENVP(
+    (transforms): ModuleList(
+      (0): StackedCNFLayers(
+        (chain): ModuleList(
+          (0): LogitTransform()
+          (1): CNF(
+            (odefunc): RegularizedODEfunc(
+              (odefunc): ODEfunc(
+                (diffeq): ODEnet(
+                  (layers): ModuleList(
+                    (0): ConcatConv2d(
+                      (_layer): Conv2d(2, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (1): ConcatConv2d(
+                      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (2): ConcatConv2d(
+                      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (3): ConcatConv2d(
+                      (_layer): Conv2d(65, 1, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                  )
+                  (activation_fns): ModuleList(
+                    (0): Softplus(beta=1, threshold=20)
+                    (1): Softplus(beta=1, threshold=20)
+                    (2): Softplus(beta=1, threshold=20)
+                  )
+                )
+              )
+            )
+          )
+          (2): CNF(
+            (odefunc): RegularizedODEfunc(
+              (odefunc): ODEfunc(
+                (diffeq): ODEnet(
+                  (layers): ModuleList(
+                    (0): ConcatConv2d(
+                      (_layer): Conv2d(2, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (1): ConcatConv2d(
+                      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (2): ConcatConv2d(
+                      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (3): ConcatConv2d(
+                      (_layer): Conv2d(65, 1, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                  )
+                  (activation_fns): ModuleList(
+                    (0): Softplus(beta=1, threshold=20)
+                    (1): Softplus(beta=1, threshold=20)
+                    (2): Softplus(beta=1, threshold=20)
+                  )
+                )
+              )
+            )
+          )
+          (3): SqueezeLayer()
+          (4): CNF(
+            (odefunc): RegularizedODEfunc(
+              (odefunc): ODEfunc(
+                (diffeq): ODEnet(
+                  (layers): ModuleList(
+                    (0): ConcatConv2d(
+                      (_layer): Conv2d(5, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (1): ConcatConv2d(
+                      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (2): ConcatConv2d(
+                      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (3): ConcatConv2d(
+                      (_layer): Conv2d(65, 4, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                  )
+                  (activation_fns): ModuleList(
+                    (0): Softplus(beta=1, threshold=20)
+                    (1): Softplus(beta=1, threshold=20)
+                    (2): Softplus(beta=1, threshold=20)
+                  )
+                )
+              )
+            )
+          )
+          (5): CNF(
+            (odefunc): RegularizedODEfunc(
+              (odefunc): ODEfunc(
+                (diffeq): ODEnet(
+                  (layers): ModuleList(
+                    (0): ConcatConv2d(
+                      (_layer): Conv2d(5, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (1): ConcatConv2d(
+                      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (2): ConcatConv2d(
+                      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (3): ConcatConv2d(
+                      (_layer): Conv2d(65, 4, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                  )
+                  (activation_fns): ModuleList(
+                    (0): Softplus(beta=1, threshold=20)
+                    (1): Softplus(beta=1, threshold=20)
+                    (2): Softplus(beta=1, threshold=20)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (1): StackedCNFLayers(
+        (chain): ModuleList(
+          (0): CNF(
+            (odefunc): RegularizedODEfunc(
+              (odefunc): ODEfunc(
+                (diffeq): ODEnet(
+                  (layers): ModuleList(
+                    (0): ConcatConv2d(
+                      (_layer): Conv2d(3, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (1): ConcatConv2d(
+                      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (2): ConcatConv2d(
+                      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (3): ConcatConv2d(
+                      (_layer): Conv2d(65, 2, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                  )
+                  (activation_fns): ModuleList(
+                    (0): Softplus(beta=1, threshold=20)
+                    (1): Softplus(beta=1, threshold=20)
+                    (2): Softplus(beta=1, threshold=20)
+                  )
+                )
+              )
+            )
+          )
+          (1): CNF(
+            (odefunc): RegularizedODEfunc(
+              (odefunc): ODEfunc(
+                (diffeq): ODEnet(
+                  (layers): ModuleList(
+                    (0): ConcatConv2d(
+                      (_layer): Conv2d(3, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (1): ConcatConv2d(
+                      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (2): ConcatConv2d(
+                      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (3): ConcatConv2d(
+                      (_layer): Conv2d(65, 2, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                  )
+                  (activation_fns): ModuleList(
+                    (0): Softplus(beta=1, threshold=20)
+                    (1): Softplus(beta=1, threshold=20)
+                    (2): Softplus(beta=1, threshold=20)
+                  )
+                )
+              )
+            )
+          )
+          (2): SqueezeLayer()
+          (3): CNF(
+            (odefunc): RegularizedODEfunc(
+              (odefunc): ODEfunc(
+                (diffeq): ODEnet(
+                  (layers): ModuleList(
+                    (0): ConcatConv2d(
+                      (_layer): Conv2d(9, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (1): ConcatConv2d(
+                      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (2): ConcatConv2d(
+                      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (3): ConcatConv2d(
+                      (_layer): Conv2d(65, 8, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                  )
+                  (activation_fns): ModuleList(
+                    (0): Softplus(beta=1, threshold=20)
+                    (1): Softplus(beta=1, threshold=20)
+                    (2): Softplus(beta=1, threshold=20)
+                  )
+                )
+              )
+            )
+          )
+          (4): CNF(
+            (odefunc): RegularizedODEfunc(
+              (odefunc): ODEfunc(
+                (diffeq): ODEnet(
+                  (layers): ModuleList(
+                    (0): ConcatConv2d(
+                      (_layer): Conv2d(9, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (1): ConcatConv2d(
+                      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (2): ConcatConv2d(
+                      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (3): ConcatConv2d(
+                      (_layer): Conv2d(65, 8, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                  )
+                  (activation_fns): ModuleList(
+                    (0): Softplus(beta=1, threshold=20)
+                    (1): Softplus(beta=1, threshold=20)
+                    (2): Softplus(beta=1, threshold=20)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (2): StackedCNFLayers(
+        (chain): ModuleList(
+          (0): CNF(
+            (odefunc): RegularizedODEfunc(
+              (odefunc): ODEfunc(
+                (diffeq): ODEnet(
+                  (layers): ModuleList(
+                    (0): ConcatConv2d(
+                      (_layer): Conv2d(5, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (1): ConcatConv2d(
+                      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (2): ConcatConv2d(
+                      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (3): ConcatConv2d(
+                      (_layer): Conv2d(65, 4, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                  )
+                  (activation_fns): ModuleList(
+                    (0): Softplus(beta=1, threshold=20)
+                    (1): Softplus(beta=1, threshold=20)
+                    (2): Softplus(beta=1, threshold=20)
+                  )
+                )
+              )
+            )
+          )
+          (1): CNF(
+            (odefunc): RegularizedODEfunc(
+              (odefunc): ODEfunc(
+                (diffeq): ODEnet(
+                  (layers): ModuleList(
+                    (0): ConcatConv2d(
+                      (_layer): Conv2d(5, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (1): ConcatConv2d(
+                      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (2): ConcatConv2d(
+                      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                    (3): ConcatConv2d(
+                      (_layer): Conv2d(65, 4, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+                    )
+                  )
+                  (activation_fns): ModuleList(
+                    (0): Softplus(beta=1, threshold=20)
+                    (1): Softplus(beta=1, threshold=20)
+                    (2): Softplus(beta=1, threshold=20)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+Number of trainable parameters: 800636
+Iters per train epoch: 300
+Iters per test: 50
+Syncing machines before training
+Itr 000000 | Wall 8.040e+00(8.04) | Time/Itr 8.04(8.04) | BPD 27.97(27.97) | Loss 27.97(27.97) | FE 320(320) | Grad Norm 2.173e+02(2.173e+02) | TT 10.00(10.00) | kinetic_energy: 2.49e-03 | jacobian_norm2: 0.00e+00
+Reducer buckets have been rebuilt in this iteration.
+Itr 000010 | Wall 4.314e+01(3.92) | Time/Itr 3.49(6.85) | BPD 27.11(27.86) | Loss 27.11(27.86) | FE 320(320) | Grad Norm 2.182e+02(2.171e+02) | TT 10.00(10.00) | kinetic_energy: 3.98e-03 | jacobian_norm2: 2.09e-08
+Itr 000020 | Wall 7.842e+01(3.73) | Time/Itr 3.54(5.98) | BPD 24.32(27.25) | Loss 24.32(27.25) | FE 320(320) | Grad Norm 2.101e+02(2.157e+02) | TT 10.00(10.00) | kinetic_energy: 3.66e-02 | jacobian_norm2: 4.80e-07
+Itr 000030 | Wall 1.140e+02(3.68) | Time/Itr 3.57(5.34) | BPD 19.83(25.83) | Loss 19.83(25.83) | FE 320(320) | Grad Norm 1.921e+02(2.117e+02) | TT 10.00(10.00) | kinetic_energy: 2.23e-01 | jacobian_norm2: 5.76e-06
+Itr 000040 | Wall 1.497e+02(3.65) | Time/Itr 3.62(4.88) | BPD 14.63(23.45) | Loss 14.64(23.45) | FE 320(320) | Grad Norm 1.340e+02(1.990e+02) | TT 10.00(10.00) | kinetic_energy: 9.40e-01 | jacobian_norm2: 5.98e-05
+Itr 000050 | Wall 1.864e+02(3.65) | Time/Itr 3.67(4.56) | BPD 11.72(20.64) | Loss 11.74(20.64) | FE 320(320) | Grad Norm 4.789e+01(1.679e+02) | TT 10.00(10.00) | kinetic_energy: 2.39e+00 | jacobian_norm2: 4.27e-04
+Itr 000060 | Wall 2.234e+02(3.66) | Time/Itr 3.74(4.33) | BPD 9.87(18.03) | Loss 9.90(18.04) | FE 320(320) | Grad Norm 3.502e+01(1.345e+02) | TT 10.00(10.00) | kinetic_energy: 3.34e+00 | jacobian_norm2: 1.65e-03
+Itr 000070 | Wall 2.609e+02(3.67) | Time/Itr 3.69(4.18) | BPD 8.43(15.65) | Loss 8.47(15.67) | FE 320(320) | Grad Norm 1.919e+01(1.049e+02) | TT 10.00(10.00) | kinetic_energy: 3.63e+00 | jacobian_norm2: 3.35e-03
+Itr 000080 | Wall 2.983e+02(3.68) | Time/Itr 3.75(4.07) | BPD 7.57(13.65) | Loss 7.62(13.67) | FE 320(320) | Grad Norm 1.631e+01(8.238e+01) | TT 10.00(10.00) | kinetic_energy: 4.64e+00 | jacobian_norm2: 7.72e-03
+Itr 000090 | Wall 3.360e+02(3.69) | Time/Itr 3.81(3.99) | BPD 6.52(11.89) | Loss 6.58(11.92) | FE 320(320) | Grad Norm 1.439e+01(6.466e+01) | TT 10.00(10.00) | kinetic_energy: 6.08e+00 | jacobian_norm2: 1.57e-02
+Itr 000100 | Wall 3.734e+02(3.70) | Time/Itr 3.69(3.92) | BPD 5.85(10.40) | Loss 5.92(10.44) | FE 320(320) | Grad Norm 1.290e+01(5.115e+01) | TT 10.00(10.00) | kinetic_energy: 6.84e+00 | jacobian_norm2: 2.56e-02
+Itr 000110 | Wall 4.111e+02(3.70) | Time/Itr 3.80(3.88) | BPD 5.39(9.13) | Loss 5.47(9.18) | FE 320(320) | Grad Norm 1.181e+01(4.095e+01) | TT 10.00(10.00) | kinetic_energy: 7.92e+00 | jacobian_norm2: 4.04e-02
+Itr 000120 | Wall 4.483e+02(3.71) | Time/Itr 3.80(3.84) | BPD 4.93(8.06) | Loss 5.02(8.12) | FE 320(320) | Grad Norm 1.063e+01(3.308e+01) | TT 10.00(10.00) | kinetic_energy: 9.16e+00 | jacobian_norm2: 6.32e-02
+Itr 000130 | Wall 4.857e+02(3.71) | Time/Itr 3.73(3.81) | BPD 4.49(7.17) | Loss 4.60(7.24) | FE 320(320) | Grad Norm 9.188e+00(2.696e+01) | TT 10.00(10.00) | kinetic_energy: 1.07e+01 | jacobian_norm2: 9.46e-02
+Itr 000140 | Wall 5.228e+02(3.71) | Time/Itr 3.74(3.79) | BPD 4.14(6.43) | Loss 4.27(6.51) | FE 320(320) | Grad Norm 8.197e+00(2.216e+01) | TT 10.00(10.00) | kinetic_energy: 1.28e+01 | jacobian_norm2: 1.35e-01
+Itr 000150 | Wall 5.601e+02(3.71) | Time/Itr 3.85(3.77) | BPD 3.90(5.80) | Loss 4.04(5.90) | FE 320(320) | Grad Norm 9.002e+00(1.861e+01) | TT 10.00(10.00) | kinetic_energy: 1.42e+01 | jacobian_norm2: 1.70e-01
+Itr 000160 | Wall 5.972e+02(3.71) | Time/Itr 3.64(3.76) | BPD 3.65(5.26) | Loss 3.80(5.37) | FE 320(320) | Grad Norm 1.100e+01(1.636e+01) | TT 10.00(10.00) | kinetic_energy: 1.48e+01 | jacobian_norm2: 2.06e-01
+Itr 000170 | Wall 6.344e+02(3.71) | Time/Itr 3.72(3.75) | BPD 3.16(4.75) | Loss 3.31(4.88) | FE 320(320) | Grad Norm 1.071e+01(1.492e+01) | TT 10.00(10.00) | kinetic_energy: 1.49e+01 | jacobian_norm2: 2.50e-01
+Itr 000180 | Wall 6.711e+02(3.71) | Time/Itr 3.61(3.73) | BPD 2.79(4.28) | Loss 2.93(4.40) | FE 320(320) | Grad Norm 8.800e+00(1.357e+01) | TT 10.00(10.00) | kinetic_energy: 1.38e+01 | jacobian_norm2: 2.89e-01
+Itr 000190 | Wall 7.085e+02(3.71) | Time/Itr 3.76(3.73) | BPD 2.55(3.85) | Loss 2.68(3.98) | FE 320(320) | Grad Norm 4.929e+00(1.174e+01) | TT 10.00(10.00) | kinetic_energy: 1.23e+01 | jacobian_norm2: 3.04e-01
+Itr 000200 | Wall 7.456e+02(3.71) | Time/Itr 3.71(3.72) | BPD 2.39(3.48) | Loss 2.50(3.61) | FE 320(320) | Grad Norm 4.106e+00(9.857e+00) | TT 10.00(10.00) | kinetic_energy: 1.11e+01 | jacobian_norm2: 3.00e-01
+Itr 000210 | Wall 7.825e+02(3.71) | Time/Itr 3.68(3.72) | BPD 2.39(3.20) | Loss 2.49(3.32) | FE 320(320) | Grad Norm 3.161e+00(8.123e+00) | TT 10.00(10.00) | kinetic_energy: 9.58e+00 | jacobian_norm2: 3.06e-01
+Itr 000220 | Wall 8.197e+02(3.71) | Time/Itr 3.71(3.71) | BPD 2.27(2.97) | Loss 2.37(3.08) | FE 320(320) | Grad Norm 2.297e+00(6.664e+00) | TT 10.00(10.00) | kinetic_energy: 8.97e+00 | jacobian_norm2: 2.96e-01
+Itr 000230 | Wall 8.567e+02(3.71) | Time/Itr 3.75(3.71) | BPD 2.26(2.78) | Loss 2.35(2.89) | FE 320(320) | Grad Norm 1.762e+00(5.454e+00) | TT 10.00(10.00) | kinetic_energy: 8.50e+00 | jacobian_norm2: 2.93e-01
+Itr 000240 | Wall 8.936e+02(3.71) | Time/Itr 3.74(3.71) | BPD 2.19(2.64) | Loss 2.27(2.74) | FE 320(320) | Grad Norm 1.290e+00(4.462e+00) | TT 10.00(10.00) | kinetic_energy: 8.27e+00 | jacobian_norm2: 2.91e-01
+Itr 000250 | Wall 9.306e+02(3.71) | Time/Itr 3.66(3.70) | BPD 2.23(2.53) | Loss 2.31(2.63) | FE 320(320) | Grad Norm 1.404e+00(3.664e+00) | TT 10.00(10.00) | kinetic_energy: 7.91e+00 | jacobian_norm2: 2.87e-01
+Itr 000260 | Wall 9.678e+02(3.71) | Time/Itr 3.71(3.71) | BPD 2.16(2.45) | Loss 2.24(2.54) | FE 320(320) | Grad Norm 1.208e+00(3.026e+00) | TT 10.00(10.00) | kinetic_energy: 7.72e+00 | jacobian_norm2: 2.79e-01
+Itr 000270 | Wall 1.005e+03(3.71) | Time/Itr 3.77(3.70) | BPD 2.18(2.38) | Loss 2.25(2.47) | FE 320(320) | Grad Norm 1.657e+00(2.590e+00) | TT 10.00(10.00) | kinetic_energy: 7.52e+00 | jacobian_norm2: 2.76e-01
+Itr 000280 | Wall 1.042e+03(3.71) | Time/Itr 3.66(3.70) | BPD 2.17(2.32) | Loss 2.24(2.41) | FE 320(320) | Grad Norm 8.802e-01(2.301e+00) | TT 10.00(10.00) | kinetic_energy: 7.34e+00 | jacobian_norm2: 2.69e-01
+Itr 000290 | Wall 1.079e+03(3.71) | Time/Itr 3.74(3.70) | BPD 2.16(2.28) | Loss 2.24(2.36) | FE 320(320) | Grad Norm 1.593e+00(2.017e+00) | TT 10.00(10.00) | kinetic_energy: 7.21e+00 | jacobian_norm2: 2.67e-01
+validating...
+Epoch 0001 | Time 92.4887, Bit/dim 2.0935, Steps 229.2800, TT 10.00, Transport Cost 5.54e-01
+Itr 000300 | Wall 1.116e+03(3.71) | Time/Itr 3.75(3.70) | BPD 2.12(2.25) | Loss 2.19(2.33) | FE 320(320) | Grad Norm 9.077e-01(1.741e+00) | TT 10.00(10.00) | kinetic_energy: 7.19e+00 | jacobian_norm2: 2.60e-01
+Itr 000310 | Wall 1.153e+03(3.71) | Time/Itr 3.78(3.70) | BPD 2.07(2.21) | Loss 2.14(2.29) | FE 320(320) | Grad Norm 1.009e+00(1.545e+00) | TT 10.00(10.00) | kinetic_energy: 7.18e+00 | jacobian_norm2: 2.48e-01
+Itr 000320 | Wall 1.189e+03(3.71) | Time/Itr 3.68(3.70) | BPD 2.07(2.18) | Loss 2.14(2.26) | FE 320(320) | Grad Norm 2.424e+00(1.470e+00) | TT 10.00(10.00) | kinetic_energy: 7.18e+00 | jacobian_norm2: 2.45e-01
+Itr 000330 | Wall 1.227e+03(3.71) | Time/Itr 3.71(3.70) | BPD 2.01(2.15) | Loss 2.09(2.23) | FE 320(320) | Grad Norm 1.763e+00(1.498e+00) | TT 10.00(10.00) | kinetic_energy: 7.42e+00 | jacobian_norm2: 2.45e-01
+Itr 000340 | Wall 1.263e+03(3.71) | Time/Itr 3.67(3.70) | BPD 2.02(2.12) | Loss 2.09(2.19) | FE 320(320) | Grad Norm 9.162e-01(1.597e+00) | TT 10.00(10.00) | kinetic_energy: 7.64e+00 | jacobian_norm2: 2.47e-01
+Itr 000350 | Wall 1.301e+03(3.71) | Time/Itr 3.66(3.70) | BPD 1.99(2.09) | Loss 2.07(2.16) | FE 320(320) | Grad Norm 2.288e+00(4.296e+00) | TT 10.00(10.00) | kinetic_energy: 7.89e+00 | jacobian_norm2: 2.51e-01
+Itr 000360 | Wall 1.338e+03(3.71) | Time/Itr 3.74(3.70) | BPD 2.24(2.12) | Loss 2.40(2.21) | FE 320(320) | Grad Norm 2.919e+01(1.722e+01) | TT 10.00(10.00) | kinetic_energy: 1.56e+01 | jacobian_norm2: 6.65e-01
+Itr 000370 | Wall 1.375e+03(3.71) | Time/Itr 3.73(3.70) | BPD 2.00(2.12) | Loss 2.14(2.21) | FE 320(320) | Grad Norm 1.639e+01(1.963e+01) | TT 10.00(10.00) | kinetic_energy: 1.37e+01 | jacobian_norm2: 2.85e-01
+Itr 000380 | Wall 1.412e+03(3.71) | Time/Itr 3.72(3.70) | BPD 2.05(2.09) | Loss 2.13(2.19) | FE 320(320) | Grad Norm 1.965e+01(1.914e+01) | TT 10.00(10.00) | kinetic_energy: 6.83e+00 | jacobian_norm2: 2.04e-01
+Itr 000390 | Wall 1.449e+03(3.70) | Time/Itr 3.63(3.70) | BPD 1.91(2.05) | Loss 2.00(2.14) | FE 320(320) | Grad Norm 4.174e+00(1.656e+01) | TT 10.00(10.00) | kinetic_energy: 8.06e+00 | jacobian_norm2: 2.60e-01
+Itr 000400 | Wall 1.486e+03(3.71) | Time/Itr 3.66(3.71) | BPD 1.89(2.02) | Loss 1.97(2.11) | FE 320(320) | Grad Norm 1.499e+00(1.380e+01) | TT 10.00(10.00) | kinetic_energy: 7.75e+00 | jacobian_norm2: 2.55e-01
+Itr 000410 | Wall 1.523e+03(3.71) | Time/Itr 3.68(3.71) | BPD 1.92(1.99) | Loss 2.00(2.07) | FE 320(320) | Grad Norm 5.350e+00(1.149e+01) | TT 10.00(10.00) | kinetic_energy: 7.87e+00 | jacobian_norm2: 2.57e-01
+Itr 000420 | Wall 1.560e+03(3.71) | Time/Itr 3.77(3.71) | BPD 1.89(1.96) | Loss 1.97(2.05) | FE 320(320) | Grad Norm 3.847e+00(9.253e+00) | TT 10.00(10.00) | kinetic_energy: 7.72e+00 | jacobian_norm2: 2.55e-01
+Itr 000430 | Wall 1.597e+03(3.71) | Time/Itr 3.74(3.71) | BPD 1.87(1.94) | Loss 1.95(2.02) | FE 320(320) | Grad Norm 2.402e+00(7.311e+00) | TT 10.00(10.00) | kinetic_energy: 7.66e+00 | jacobian_norm2: 2.56e-01
+Itr 000440 | Wall 1.634e+03(3.71) | Time/Itr 3.72(3.71) | BPD 1.84(1.92) | Loss 1.92(2.00) | FE 320(320) | Grad Norm 1.553e+00(5.774e+00) | TT 10.00(10.00) | kinetic_energy: 7.67e+00 | jacobian_norm2: 2.54e-01
+Itr 000450 | Wall 1.671e+03(3.71) | Time/Itr 3.70(3.71) | BPD 1.85(1.90) | Loss 1.93(1.99) | FE 320(320) | Grad Norm 7.309e-01(4.603e+00) | TT 10.00(10.00) | kinetic_energy: 7.55e+00 | jacobian_norm2: 2.57e-01
+Itr 000460 | Wall 1.708e+03(3.71) | Time/Itr 3.65(3.71) | BPD 1.87(1.89) | Loss 1.95(1.97) | FE 320(320) | Grad Norm 1.055e+00(3.684e+00) | TT 10.00(10.00) | kinetic_energy: 7.45e+00 | jacobian_norm2: 2.60e-01
+Itr 000470 | Wall 1.745e+03(3.71) | Time/Itr 3.71(3.71) | BPD 1.85(1.88) | Loss 1.93(1.96) | FE 320(320) | Grad Norm 1.938e+00(3.022e+00) | TT 10.00(10.00) | kinetic_energy: 7.46e+00 | jacobian_norm2: 2.66e-01
+Itr 000480 | Wall 1.782e+03(3.71) | Time/Itr 3.70(3.71) | BPD 1.84(1.87) | Loss 1.91(1.95) | FE 320(320) | Grad Norm 6.004e-01(2.630e+00) | TT 10.00(10.00) | kinetic_energy: 7.33e+00 | jacobian_norm2: 2.63e-01
+Itr 000490 | Wall 1.819e+03(3.71) | Time/Itr 3.69(3.71) | BPD 1.83(1.86) | Loss 1.91(1.94) | FE 320(320) | Grad Norm 9.877e-01(2.143e+00) | TT 10.00(10.00) | kinetic_energy: 7.25e+00 | jacobian_norm2: 2.66e-01
+Itr 000500 | Wall 1.857e+03(3.71) | Time/Itr 3.72(3.71) | BPD 1.80(1.85) | Loss 1.87(1.93) | FE 320(320) | Grad Norm 1.881e+00(1.863e+00) | TT 10.00(10.00) | kinetic_energy: 7.17e+00 | jacobian_norm2: 2.59e-01
+Itr 000510 | Wall 1.893e+03(3.71) | Time/Itr 3.64(3.70) | BPD 1.86(1.85) | Loss 1.93(1.92) | FE 320(320) | Grad Norm 5.774e+00(2.193e+00) | TT 10.00(10.00) | kinetic_energy: 6.93e+00 | jacobian_norm2: 2.63e-01
+Itr 000520 | Wall 1.931e+03(3.71) | Time/Itr 3.68(3.71) | BPD 1.79(1.84) | Loss 1.86(1.91) | FE 320(320) | Grad Norm 4.956e+00(2.586e+00) | TT 10.00(10.00) | kinetic_energy: 6.93e+00 | jacobian_norm2: 2.60e-01
+Itr 000530 | Wall 1.968e+03(3.71) | Time/Itr 3.68(3.71) | BPD 1.80(1.83) | Loss 1.88(1.91) | FE 320(320) | Grad Norm 7.707e+00(3.666e+00) | TT 10.00(10.00) | kinetic_energy: 7.14e+00 | jacobian_norm2: 2.77e-01
+Itr 000540 | Wall 2.005e+03(3.71) | Time/Itr 3.74(3.71) | BPD 1.76(1.82) | Loss 1.83(1.90) | FE 320(320) | Grad Norm 3.789e+00(5.159e+00) | TT 10.00(10.00) | kinetic_energy: 6.99e+00 | jacobian_norm2: 2.76e-01
+Itr 000550 | Wall 2.042e+03(3.71) | Time/Itr 3.73(3.71) | BPD 1.84(1.82) | Loss 1.92(1.90) | FE 320(320) | Grad Norm 1.944e+01(1.074e+01) | TT 10.00(10.00) | kinetic_energy: 7.46e+00 | jacobian_norm2: 3.32e-01
+Itr 000560 | Wall 2.079e+03(3.71) | Time/Itr 3.75(3.71) | BPD 1.79(1.82) | Loss 1.85(1.90) | FE 320(320) | Grad Norm 1.380e+01(1.153e+01) | TT 10.00(10.00) | kinetic_energy: 6.28e+00 | jacobian_norm2: 2.47e-01
+Itr 000570 | Wall 2.116e+03(3.71) | Time/Itr 3.76(3.71) | BPD 1.79(1.82) | Loss 1.86(1.89) | FE 320(320) | Grad Norm 4.798e+00(1.048e+01) | TT 10.00(10.00) | kinetic_energy: 6.77e+00 | jacobian_norm2: 2.79e-01
+Itr 000580 | Wall 2.153e+03(3.71) | Time/Itr 3.68(3.70) | BPD 1.79(1.81) | Loss 1.86(1.88) | FE 320(320) | Grad Norm 7.457e+00(9.131e+00) | TT 10.00(10.00) | kinetic_energy: 6.79e+00 | jacobian_norm2: 2.89e-01
+Itr 000590 | Wall 2.190e+03(3.71) | Time/Itr 3.71(3.70) | BPD 1.79(1.81) | Loss 1.86(1.88) | FE 320(320) | Grad Norm 5.600e+00(8.582e+00) | TT 10.00(10.00) | kinetic_energy: 6.64e+00 | jacobian_norm2: 2.80e-01
+validating...
+Epoch 0002 | Time 102.6550, Bit/dim 1.5990, Steps 244.7600, TT 10.00, Transport Cost 3.40e-01
+Itr 000600 | Wall 2.227e+03(3.71) | Time/Itr 3.70(3.70) | BPD 1.77(1.80) | Loss 1.83(1.87) | FE 320(320) | Grad Norm 3.598e+00(7.477e+00) | TT 10.00(10.00) | kinetic_energy: 6.34e+00 | jacobian_norm2: 2.65e-01
+Itr 000610 | Wall 2.264e+03(3.71) | Time/Itr 3.65(3.70) | BPD 1.74(1.80) | Loss 1.81(1.86) | FE 320(320) | Grad Norm 4.085e+00(6.198e+00) | TT 10.00(10.00) | kinetic_energy: 6.34e+00 | jacobian_norm2: 2.74e-01
+Itr 000620 | Wall 2.301e+03(3.70) | Time/Itr 3.70(3.70) | BPD 1.76(1.79) | Loss 1.83(1.86) | FE 320(320) | Grad Norm 8.439e+00(6.540e+00) | TT 10.00(10.00) | kinetic_energy: 6.59e+00 | jacobian_norm2: 2.92e-01
+Itr 000630 | Wall 2.338e+03(3.70) | Time/Itr 3.71(3.70) | BPD 1.75(1.79) | Loss 1.82(1.86) | FE 320(320) | Grad Norm 2.132e+01(8.032e+00) | TT 10.00(10.00) | kinetic_energy: 7.04e+00 | jacobian_norm2: 3.39e-01
+Itr 000640 | Wall 2.375e+03(3.70) | Time/Itr 3.71(3.69) | BPD 1.92(1.79) | Loss 1.98(1.86) | FE 320(320) | Grad Norm 7.756e+01(1.162e+01) | TT 10.00(10.00) | kinetic_energy: 5.05e+00 | jacobian_norm2: 2.25e-01
+Itr 000650 | Wall 2.411e+03(3.70) | Time/Itr 3.62(3.69) | BPD 1.93(1.84) | Loss 2.02(1.92) | FE 320(320) | Grad Norm 1.351e+01(1.528e+01) | TT 10.00(10.00) | kinetic_energy: 8.69e+00 | jacobian_norm2: 4.61e-01
+Itr 000660 | Wall 2.448e+03(3.70) | Time/Itr 3.61(3.69) | BPD 1.82(1.84) | Loss 1.88(1.92) | FE 320(320) | Grad Norm 1.117e+01(1.432e+01) | TT 10.00(10.00) | kinetic_energy: 5.75e+00 | jacobian_norm2: 2.44e-01
+Itr 000670 | Wall 2.486e+03(3.70) | Time/Itr 3.72(3.70) | BPD 1.79(1.83) | Loss 1.86(1.90) | FE 320(320) | Grad Norm 8.822e+00(1.287e+01) | TT 10.00(10.00) | kinetic_energy: 6.84e+00 | jacobian_norm2: 3.26e-01
+Itr 000680 | Wall 2.522e+03(3.70) | Time/Itr 3.66(3.70) | BPD 1.80(1.82) | Loss 1.86(1.89) | FE 320(320) | Grad Norm 6.229e+00(1.104e+01) | TT 10.00(10.00) | kinetic_energy: 5.85e+00 | jacobian_norm2: 2.69e-01
+Itr 000690 | Wall 2.559e+03(3.70) | Time/Itr 3.69(3.70) | BPD 1.73(1.80) | Loss 1.80(1.87) | FE 320(320) | Grad Norm 5.374e+00(9.172e+00) | TT 10.00(10.00) | kinetic_energy: 5.89e+00 | jacobian_norm2: 2.78e-01
+Itr 000700 | Wall 2.597e+03(3.70) | Time/Itr 3.71(3.70) | BPD 1.73(1.79) | Loss 1.80(1.85) | FE 320(320) | Grad Norm 1.908e+00(7.428e+00) | TT 10.00(10.00) | kinetic_energy: 6.32e+00 | jacobian_norm2: 3.17e-01
+Itr 000710 | Wall 2.633e+03(3.70) | Time/Itr 3.65(3.70) | BPD 1.76(1.77) | Loss 1.83(1.84) | FE 320(320) | Grad Norm 9.403e-01(6.017e+00) | TT 10.00(10.00) | kinetic_energy: 6.12e+00 | jacobian_norm2: 3.22e-01
+Itr 000720 | Wall 2.671e+03(3.70) | Time/Itr 3.68(3.70) | BPD 1.73(1.76) | Loss 1.79(1.83) | FE 320(320) | Grad Norm 2.598e+00(4.964e+00) | TT 10.00(10.00) | kinetic_energy: 6.21e+00 | jacobian_norm2: 3.47e-01
+Itr 000730 | Wall 2.707e+03(3.70) | Time/Itr 3.63(3.70) | BPD 1.71(1.75) | Loss 1.77(1.82) | FE 320(320) | Grad Norm 7.646e-01(4.042e+00) | TT 10.00(10.00) | kinetic_energy: 6.01e+00 | jacobian_norm2: 3.57e-01
+Itr 000740 | Wall 2.744e+03(3.70) | Time/Itr 3.71(3.70) | BPD 1.69(1.74) | Loss 1.75(1.81) | FE 320(320) | Grad Norm 1.549e+01(4.307e+00) | TT 10.00(10.00) | kinetic_energy: 5.54e+00 | jacobian_norm2: 3.28e-01
+Itr 000750 | Wall 2.781e+03(3.70) | Time/Itr 3.70(3.70) | BPD 1.72(1.73) | Loss 1.78(1.80) | FE 320(320) | Grad Norm 1.253e+01(6.451e+00) | TT 10.00(10.00) | kinetic_energy: 5.45e+00 | jacobian_norm2: 3.21e-01
+Itr 000760 | Wall 2.819e+03(3.70) | Time/Itr 3.70(3.70) | BPD 1.82(1.74) | Loss 1.87(1.80) | FE 320(320) | Grad Norm 2.141e+01(9.403e+00) | TT 10.00(10.00) | kinetic_energy: 5.30e+00 | jacobian_norm2: 2.60e-01
+Itr 000770 | Wall 2.855e+03(3.70) | Time/Itr 3.76(3.69) | BPD 1.71(1.73) | Loss 1.77(1.80) | FE 320(320) | Grad Norm 5.019e+00(9.777e+00) | TT 10.00(10.00) | kinetic_energy: 6.13e+00 | jacobian_norm2: 4.39e-01
+Itr 000780 | Wall 2.892e+03(3.70) | Time/Itr 3.76(3.69) | BPD 1.69(1.73) | Loss 1.75(1.79) | FE 320(320) | Grad Norm 2.729e+00(9.025e+00) | TT 10.00(10.00) | kinetic_energy: 5.64e+00 | jacobian_norm2: 4.00e-01
+Itr 000790 | Wall 2.929e+03(3.70) | Time/Itr 3.60(3.69) | BPD 1.68(1.72) | Loss 1.74(1.78) | FE 320(320) | Grad Norm 2.239e+00(8.247e+00) | TT 10.00(10.00) | kinetic_energy: 5.63e+00 | jacobian_norm2: 4.42e-01
+Itr 000800 | Wall 2.966e+03(3.70) | Time/Itr 3.73(3.70) | BPD 1.64(1.70) | Loss 1.71(1.77) | FE 320(320) | Grad Norm 8.721e+00(7.711e+00) | TT 10.00(10.00) | kinetic_energy: 6.12e+00 | jacobian_norm2: 5.31e-01
+Itr 000810 | Wall 3.003e+03(3.70) | Time/Itr 3.74(3.70) | BPD 1.71(1.70) | Loss 1.77(1.76) | FE 320(320) | Grad Norm 1.147e+01(7.843e+00) | TT 10.00(10.00) | kinetic_energy: 5.31e+00 | jacobian_norm2: 4.46e-01
+Itr 000820 | Wall 3.040e+03(3.70) | Time/Itr 3.72(3.69) | BPD 1.64(1.69) | Loss 1.72(1.75) | FE 320(320) | Grad Norm 2.092e+01(8.681e+00) | TT 10.00(10.00) | kinetic_energy: 6.89e+00 | jacobian_norm2: 7.01e-01
+Itr 000830 | Wall 3.077e+03(3.70) | Time/Itr 3.73(3.69) | BPD 1.65(1.68) | Loss 1.70(1.74) | FE 320(320) | Grad Norm 1.038e+01(9.673e+00) | TT 10.00(10.00) | kinetic_energy: 5.24e+00 | jacobian_norm2: 4.86e-01
+Itr 000840 | Wall 3.114e+03(3.70) | Time/Itr 3.65(3.69) | BPD 1.58(1.67) | Loss 1.65(1.73) | FE 320(320) | Grad Norm 1.264e+01(9.918e+00) | TT 10.00(10.00) | kinetic_energy: 6.36e+00 | jacobian_norm2: 7.04e-01
+Itr 000850 | Wall 3.151e+03(3.70) | Time/Itr 3.73(3.70) | BPD 1.63(1.65) | Loss 1.70(1.72) | FE 320(320) | Grad Norm 1.275e+01(9.562e+00) | TT 10.00(10.00) | kinetic_energy: 6.27e+00 | jacobian_norm2: 7.14e-01
+Itr 000860 | Wall 3.188e+03(3.70) | Time/Itr 3.65(3.69) | BPD 1.60(1.65) | Loss 1.66(1.71) | FE 320(320) | Grad Norm 1.242e+01(1.026e+01) | TT 10.00(10.00) | kinetic_energy: 5.17e+00 | jacobian_norm2: 4.96e-01
+Itr 000870 | Wall 3.225e+03(3.70) | Time/Itr 3.66(3.70) | BPD 1.61(1.64) | Loss 1.68(1.70) | FE 320(320) | Grad Norm 1.353e+01(1.041e+01) | TT 10.00(10.00) | kinetic_energy: 6.32e+00 | jacobian_norm2: 8.03e-01
+Itr 000880 | Wall 3.262e+03(3.70) | Time/Itr 3.73(3.70) | BPD 1.57(1.63) | Loss 1.64(1.69) | FE 320(320) | Grad Norm 8.990e+00(1.062e+01) | TT 10.00(10.00) | kinetic_energy: 5.94e+00 | jacobian_norm2: 7.44e-01
+Itr 000890 | Wall 3.299e+03(3.70) | Time/Itr 3.71(3.70) | BPD 1.56(1.62) | Loss 1.63(1.68) | FE 320(320) | Grad Norm 1.129e+01(1.045e+01) | TT 10.00(10.00) | kinetic_energy: 5.99e+00 | jacobian_norm2: 8.13e-01
+validating...
+Epoch 0003 | Time 90.4695, Bit/dim 1.2616, Steps 231.3200, TT 10.00, Transport Cost 3.09e-01
+Itr 000900 | Wall 3.335e+03(3.70) | Time/Itr 3.71(3.69) | BPD 1.65(1.61) | Loss 1.74(1.67) | FE 320(320) | Grad Norm 3.305e+01(1.137e+01) | TT 10.00(10.00) | kinetic_energy: 7.78e+00 | jacobian_norm2: 1.11e+00
