@@ -15,7 +15,7 @@ from torchvision.utils import save_image
 import lib.layers as layers
 import lib.utils as utils
 import lib.odenvp as odenvp
-#import lib.multiscale_parallel as multiscale_parallel
+# import lib.multiscale_parallel as multiscale_parallel
 
 from train_misc import standard_normal_logprob
 from train_misc import set_cnf_options, count_nfe, count_parameters, count_total_time
@@ -44,7 +44,7 @@ parser.add_argument(
 )
 parser.add_argument('--solver', type=str, default='dopri5', choices=SOLVERS)
 parser.add_argument('--atol', type=float, default=1e-5, help='only for adaptive solvers')
-parser.add_argument('--rtol', type=float, default=1e-5,  help='only for adaptive solvers')
+parser.add_argument('--rtol', type=float, default=1e-5, help='only for adaptive solvers')
 parser.add_argument('--step_size', type=float, default=0.25, help='only for fixed step size solvers')
 parser.add_argument('--first_step', type=float, default=0.25, help='only for adaptive solvers')
 
@@ -63,7 +63,7 @@ parser.add_argument('--train_T', type=eval, default=False)
 parser.add_argument("--batch_size", type=int, default=200)
 parser.add_argument("--test_batch_size", type=int, default=48)
 
-parser.add_argument('--div_samples',type=int, default=1)
+parser.add_argument('--div_samples', type=int, default=1)
 parser.add_argument('--zero_last', type=eval, default=True, choices=[True, False])
 
 # Regularizations
@@ -79,26 +79,27 @@ parser.add_argument('--validate', type=eval, default=True, choices=[True, False]
 parser.add_argument('--generate', type=eval, default=True, choices=[True, False])
 parser.add_argument('--save-real', type=eval, default=True, choices=[True, False])
 
-
 args = parser.parse_args()
 
 assert args.chkpt is not None
 
 
 def unshift(x, nbits=8):
-    return x.add_(-1/(2**(nbits+1)))
+    return x.add_(-1 / (2 ** (nbits + 1)))
+
 
 def add_noise(x, nbits=8):
-    if nbits<8:
-        x = x // (2**(8-nbits))
+    if nbits < 8:
+        x = x // (2 ** (8 - nbits))
     noise = x.new().resize_as_(x).uniform_()
-    return x.add_(noise).div_(2**nbits)
+    return x.add_(noise).div_(2 ** nbits)
+
 
 def shift(x, nbits=8):
-    if nbits<8:
-        x = x // (2**(8-nbits))
+    if nbits < 8:
+        x = x // (2 ** (8 - nbits))
 
-    return x.add_(1/2).div_(2**nbits)
+    return x.add_(1 / 2).div_(2 ** nbits)
 
 
 def get_dataset(args):
@@ -139,7 +140,7 @@ def get_dataset(args):
             ])
         )
         test_set = CelebAHQ(
-            train=False, root='/mnt/data/scratch/data/',  transform=tforms.Compose([
+            train=False, root='/mnt/data/scratch/data/', transform=tforms.Compose([
                 tforms.ToPILImage(),
                 tforms.Resize(im_size),
                 tforms.ToTensor()
@@ -151,8 +152,6 @@ def get_dataset(args):
         dataset=test_set, batch_size=args.test_batch_size, shuffle=False, drop_last=True
     )
     return train_set, test_loader, data_shape
-
-
 
 
 def create_model(args, data_shape, regularization_fns):
@@ -185,13 +184,10 @@ if __name__ == "__main__":
     # load dataset
     train_set, test_loader, data_shape = get_dataset(args)
 
-
     # build model
     regularization_fns, regularization_coeffs = create_regularization_fns(args)
     model = create_model(args, data_shape, regularization_fns)
     set_cnf_options(args, model)
-
-
 
     # restore parameters
     if args.chkpt is not None:
@@ -204,16 +200,15 @@ if __name__ == "__main__":
     # For visualization.
     fixed_z = cvt(torch.randn(args.test_batch_size, *data_shape))
 
-
     chkdir = os.path.dirname(args.chkpt)
-    tedf = pd.read_csv(os.path.join(chkdir,'test.csv'))
-    trdf = pd.read_csv(os.path.join(chkdir,'training.csv'))
-    #wall_clock = trdf['wall'].to_numpy()[-1]
-    #itr = trdf['itr'].to_numpy()[-1]
-    #best_loss = tedf['bpd'].min()
-    #begin_epoch = int(tedf['epoch'].to_numpy()[-1]+1) # not exactly correct
-    
-    nvals = 2**args.nbits
+    tedf = pd.read_csv(os.path.join(chkdir, 'test.csv'))
+    trdf = pd.read_csv(os.path.join(chkdir, 'training.csv'))
+    # wall_clock = trdf['wall'].to_numpy()[-1]
+    # itr = trdf['itr'].to_numpy()[-1]
+    # best_loss = tedf['bpd'].min()
+    # begin_epoch = int(tedf['epoch'].to_numpy()[-1]+1) # not exactly correct
+
+    nvals = 2 ** args.nbits
 
     model.eval()
     with torch.no_grad():
@@ -222,9 +217,8 @@ if __name__ == "__main__":
             cleanbpd = 0.
             dirtybpd = 0.
             for i, (x, y) in enumerate(test_loader):
-
-                xdirty = add_noise(cvt(255*x), nbits=args.nbits)
-                xclean = shift(cvt(255*x), nbits=args.nbits)
+                xdirty = add_noise(cvt(255 * x), nbits=args.nbits)
+                xclean = shift(cvt(255 * x), nbits=args.nbits)
 
                 # Dirty
                 # -----
@@ -236,7 +230,7 @@ if __name__ == "__main__":
 
                 logpx_per_dim = torch.sum(logpx) / x.nelement()  # averaged over batches
                 bits_per_dim = -(logpx_per_dim - np.log(nvals)) / np.log(2)
-                dirtybpd = bits_per_dim.detach().cpu().item()/(i+1) + i/(i+1) * dirtybpd
+                dirtybpd = bits_per_dim.detach().cpu().item() / (i + 1) + i / (i + 1) * dirtybpd
 
                 # Clean
                 # -----
@@ -248,28 +242,28 @@ if __name__ == "__main__":
 
                 logpx_per_dim = torch.sum(logpx) / x.nelement()  # averaged over batches
                 bits_per_dim = -(logpx_per_dim - np.log(nvals)) / np.log(2)
-                cleanbpd = bits_per_dim.detach().cpu().item()/(i+1) + i/(i+1) * cleanbpd
-                print('[%3d/%3d] clean %5.3g, dirty %5.3g   '%(i, len(test_loader), cleanbpd, dirtybpd), end='\r')
+                cleanbpd = bits_per_dim.detach().cpu().item() / (i + 1) + i / (i + 1) * cleanbpd
+                print('[%3d/%3d] clean %5.3g, dirty %5.3g   ' % (i, len(test_loader), cleanbpd, dirtybpd), end='\r')
 
-            print('\nClean test bpd: %.5g'%cleanbpd)
-            print('Dirty test bpd: %.5g'%dirtybpd)
+            print('\nClean test bpd: %.5g' % cleanbpd)
+            print('Dirty test bpd: %.5g' % dirtybpd)
 
         if args.save_real:
             for i, (x, y) in enumerate(test_loader):
-                if i<10:
+                if i < 10:
                     pass
-                elif i==10:
-                    real= x.size(0)
+                elif i == 10:
+                    real = x.size(0)
                 else:
                     break
             fig_filename = os.path.join(chkdir, "real.jpg")
             save_image(x, fig_filename, nrow=args.nrow)
         if args.generate:
             print('\nGenerating images... ')
-            for t in [1.,0.9,0.8,0.7,0.6,0.5]:
+            for t in [1., 0.9, 0.8, 0.7, 0.6, 0.5]:
                 # visualize samples and density
-                fig_filename = os.path.join(chkdir, "generated-T%g.jpg"%t)
+                fig_filename = os.path.join(chkdir, "generated-T%g.jpg" % t)
                 utils.makedirs(os.path.dirname(fig_filename))
-                generated_samples = model(t*fixed_z, reverse=True)
+                generated_samples = model(t * fixed_z, reverse=True)
                 x = unshift(generated_samples[0].view(-1, *data_shape), 8)
                 save_image(x, fig_filename, nrow=args.nrow)
