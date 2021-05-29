@@ -264,13 +264,6 @@ if __name__ == "__main__":
                     break
             fig_filename = os.path.join(chkdir, "real.jpg")
             save_image(x, fig_filename, nrow=args.nrow)
-
-            
-
-            
-
-
-
         if args.generate:
             print('\nGenerating images... ')
             for t in [1.,0.9,0.8,0.7,0.6,0.5]:
