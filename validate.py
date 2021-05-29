@@ -208,10 +208,10 @@ if __name__ == "__main__":
     chkdir = os.path.dirname(args.chkpt)
     tedf = pd.read_csv(os.path.join(chkdir,'test.csv'))
     trdf = pd.read_csv(os.path.join(chkdir,'training.csv'))
-    wall_clock = trdf['wall'].to_numpy()[-1]
-    itr = trdf['itr'].to_numpy()[-1]
-    best_loss = tedf['bpd'].min()
-    begin_epoch = int(tedf['epoch'].to_numpy()[-1]+1) # not exactly correct
+    #wall_clock = trdf['wall'].to_numpy()[-1]
+    #itr = trdf['itr'].to_numpy()[-1]
+    #best_loss = tedf['bpd'].min()
+    #begin_epoch = int(tedf['epoch'].to_numpy()[-1]+1) # not exactly correct
     
     nvals = 2**args.nbits
 
