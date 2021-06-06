@@ -9,7 +9,7 @@ dims: 64,64,64
 directional_penalty: null
 dist_backend: nccl
 dist_url: env://
-distributed: false
+distributed: true
 div_samples: 1
 divergence_fn: approximate
 first_step: 0.166667

@@ -204,7 +204,7 @@ def get_dataset(args):
             im_dim = 12
             im_size = 8
         train_set = CelebDataset(root="./data/CelebAMask-HQ/training_sets/" + str(block))
-        test_set = CelebDataset(root="./data/CelebAMask-HQ/test_sets/"+ str(block))
+        test_set = CelebDataset(root="./data/CelebAMask-HQ/test_sets/" + str(block))
     elif args.data == 'imagenet64':
         im_dim = 3
         if args.imagesize != 64:
@@ -249,13 +249,20 @@ def get_dataset(args):
 
         return tensor, targets
 
+    train_sampler = (DistributedSampler(train_set,
+                                        num_replicas=env_world_size(), rank=env_rank()) if args.distributed
+                     else None)
     train_loader = torch.utils.data.DataLoader(
         dataset=train_set, batch_size=16,  # shuffle=True,
-        num_workers=8, pin_memory=True)
+        num_workers=8, pin_memory=True, sampler=train_sampler)
 
+    test_sampler = (DistributedSampler(test_set,
+                                       num_replicas=env_world_size(), rank=env_rank(),
+                                       shuffle=False) if args.distributed
+                    else None)
     test_loader = torch.utils.data.DataLoader(
         dataset=test_set, batch_size=16,  # shuffle=False,
-        num_workers=8, pin_memory=True
+        num_workers=8, pin_memory=True, sampler=test_sampler
     )
 
     return train_loader, test_loader, data_shape
@@ -541,7 +548,7 @@ def main():
                     for i, (x, y) in enumerate(test_loader):
                         sh = x.shape
                         x = shift(cvt(x), nbits=args.nbits)
-                        loss, (x, z), _ , out = compute_bits_per_dim(x, model)
+                        loss, (x, z), _, out = compute_bits_per_dim(x, model)
                         dist = (x.view(x.size(0), -1) - z).pow(2).mean(dim=-1).mean()
                         meandist = i / (i + 1) * dist + meandist / (i + 1)
                         lossmean = i / (i + 1) * lossmean + loss / (i + 1)
@@ -602,5 +609,5 @@ if __name__ == '__main__':
     #     import traceback
     #
     #     traceback.print_tb(exc_traceback, file=sys.stdout)
-        # in case of exception, wait 2 hours before shutting down
-        # if not args.skip_auto_shutdown: os.system(f'sudo shutdown -h -P +{args.auto_shutdown_failure_delay_mins}')
+    # in case of exception, wait 2 hours before shutting down
+    # if not args.skip_auto_shutdown: os.system(f'sudo shutdown -h -P +{args.auto_shutdown_failure_delay_mins}')
