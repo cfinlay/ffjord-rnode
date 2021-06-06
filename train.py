@@ -347,7 +347,7 @@ def main():
 
     # build model
     regularization_fns, regularization_coeffs = create_regularization_fns(args)
-    model = create_model(args, data_shape, regularization_fns)
+    model = create_model(args, data_shape, regularization_fns).cuda()
     # model = model.cuda()
     if args.distributed: model = dist_utils.DDP(model,
                                                 device_ids=[args.local_rank],
@@ -471,9 +471,9 @@ def main():
                                             bpd.item(),
                                             nfe_opt,
                                             grad_norm,
-                                            *reg_states]).float()
+                                            *reg_states]).float().cuda()
 
-                    rv = tuple(torch.tensor(0.) for r in reg_states)
+                    rv = tuple(torch.tensor(0.).cuda() for r in reg_states)
 
                     total_gpus, batch_total, r_loss, r_bpd, r_nfe, r_grad_norm, *rv = dist_utils.sum_tensor(
                         metrics).cpu().numpy()
