@@ -430,6 +430,7 @@ def main():
                 for i in range(number_of_batches):
                     x, label = next(iter(train_loader))
                     x, label = x.cuda(), label.cuda()
+                    print(type(x))
                     start = time.time()
                     update_lr(optimizer, itr)
                     optimizer.zero_grad()
