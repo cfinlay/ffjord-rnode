@@ -1,5 +1,6 @@
 *__pycache__*
 *.pyc
 data/MNIST
+data/CelebAMask-HQ.zip
 *.idea
 *'..*
