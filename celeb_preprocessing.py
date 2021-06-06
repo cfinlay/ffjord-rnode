@@ -2,11 +2,10 @@ import torch
 import os
 import numpy as np
 from skimage import io
-from torch.utils.data import Dataset
 import torchvision.transforms as tforms
 
 
-class CelebDataset(Dataset):
+class CelebPreprocessing():
     """Face Landmarks dataset."""
 
     def __init__(self, root, save_files_path, transform=None, number_of_downscales=4, downscale_factor=2):
