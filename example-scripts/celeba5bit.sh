@@ -23,3 +23,4 @@ python -m torch.distributed.launch \
   --jacobian-norm2 $JF \
   --alpha 0.05 \
   --test_solver dopri5 --test_atol 1e-5 --test_rtol 1e-5 \
+  --solver "rk4" \
