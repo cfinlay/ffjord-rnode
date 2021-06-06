@@ -203,8 +203,8 @@ def get_dataset(args):
         if block == 2:
             im_dim = 12
             im_size = 8
-        train_set = CelebDataset(root="./data/CelebAMask-HQ/training_sets/" + str(block))
-        test_set = CelebDataset(root="./data/CelebAMask-HQ/test_sets/" + str(block))
+        train_set = CelebDataset(root="/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/training_sets/" + str(block))
+        test_set = CelebDataset(root="/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/test_sets/" + str(block))
     elif args.data == 'imagenet64':
         im_dim = 3
         if args.imagesize != 64:

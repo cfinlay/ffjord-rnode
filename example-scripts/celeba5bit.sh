@@ -11,7 +11,6 @@ OMP_NUM_THREADS=5 \
 python -m torch.distributed.launch \
   --nproc_per_node=$NUM_GPUS --nnodes=1 --node_rank=0 \
   ../train.py --data $DATA \
-  --distributed \
   --nbits 5 \
   --log_freq 1 \
   --datadir $DATADIR \
