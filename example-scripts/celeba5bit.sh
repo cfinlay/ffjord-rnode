@@ -15,7 +15,7 @@ python -m torch.distributed.launch \
   --nbits 5 \
   --log_freq 1 \
   --datadir $DATADIR \
-  --batch_size 3 \
+  --batch_size 64 \
   --test_batch_size 3 \
   --num_epochs 16 \
   --save $SAVE \
