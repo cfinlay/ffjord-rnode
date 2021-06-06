@@ -429,7 +429,7 @@ def main():
                 number_of_batches = length_of_trainloader // train_loader.batch_size
                 for i in range(number_of_batches):
                     x, label = next(iter(train_loader))
-                    print(x.shape, label.shape)
+                    x, label = x.cuda(), label.cuda()
                     start = time.time()
                     update_lr(optimizer, itr)
                     optimizer.zero_grad()
