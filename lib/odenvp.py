@@ -18,40 +18,40 @@ class ODENVP(nn.Module):
     """
 
     def __init__(
-        self,
-        input_size,
-        n_scale=float('inf'),
-        n_blocks=2,
-        strides=None,
-        intermediate_dims=(32,),
-        nonlinearity="softplus",
-        layer_type="concat",
-        squash_input=True,
-        squeeze_first=False,
-        zero_last=True,
-        div_samples=1,
-        alpha=0.05,
-        cnf_kwargs=None,
+            self,
+            input_size,
+            n_scale=float('inf'),
+            n_blocks=2,
+            strides=None,
+            intermediate_dims=(32,),
+            nonlinearity="softplus",
+            layer_type="concat",
+            squash_input=True,
+            squeeze_first=False,
+            zero_last=True,
+            div_samples=1,
+            alpha=0.05,
+            cnf_kwargs=None,
     ):
         super(ODENVP, self).__init__()
         if squeeze_first:
             bsz, c, w, h = input_size
-            c, w, h = c*4, w//2, h//2
+            c, w, h = c * 4, w // 2, h // 2
             input_size = bsz, c, w, h
 
-        self.n_scale = min(n_scale, self._calc_n_scale(input_size))
+        # self.n_scale = min(n_scale, self._calc_n_scale(input_size))
+        self.n_scale = 1
         self.n_blocks = n_blocks
         self.intermediate_dims = intermediate_dims
-        self.layer_type=layer_type
-        self.zero_last=zero_last
-        self.div_samples=div_samples
+        self.layer_type = layer_type
+        self.zero_last = zero_last
+        self.div_samples = div_samples
         self.nonlinearity = nonlinearity
-        self.strides=strides
+        self.strides = strides
         self.squash_input = squash_input
         self.alpha = alpha
         self.squeeze_first = squeeze_first
         self.cnf_kwargs = cnf_kwargs if cnf_kwargs else {}
-
 
         if not self.n_scale > 0:
             raise ValueError('Could not compute number of scales for input of' 'size (%d,%d,%d,%d)' % input_size)
@@ -72,7 +72,7 @@ class ODENVP(nn.Module):
                     layer_type=self.layer_type,
                     strides=self.strides,
                     idims=self.intermediate_dims,
-                    squeeze=(i < self.n_scale - 1),  # don't squeeze last layer
+                    squeeze=True,  # don't squeeze last layer
                     init_layer=(layers.LogitTransform(self.alpha) if self.alpha > 0 else layers.ZeroMeanTransform())
                     if self.squash_input and i == 0 else None,
                     n_blocks=self.n_blocks,
@@ -82,7 +82,6 @@ class ODENVP(nn.Module):
             )
             c, h, w = c * 2, h // 2, w // 2
         return nn.ModuleList(transforms)
-
 
     def _calc_n_scale(self, input_size):
         _, _, h, w = input_size
@@ -97,7 +96,7 @@ class ODENVP(nn.Module):
         n, c, h, w = input_size
         output_sizes = []
         for i in range(self.n_scale):
-            if i < self.n_scale - 1:
+            if i <= self.n_scale - 1:
                 c *= 2
                 h //= 2
                 w //= 2
@@ -117,7 +116,7 @@ class ODENVP(nn.Module):
         else:
             if self.squeeze_first:
                 x = squeeze(x)
-            return self._logdensity(x, logpx, reg_states)
+            return self._logdensity_single(x, logpx, reg_states)
 
     def _logdensity(self, x, logpx=None, reg_states=tuple()):
         _logpx = torch.zeros(x.shape[0], 1).to(x) if logpx is None else logpx
@@ -134,6 +133,25 @@ class ODENVP(nn.Module):
         out = [o.view(o.size()[0], -1) for o in out]
         out = torch.cat(out, 1)
         return out, _logpx, reg_states
+
+    def _logdensity_single(self, x, logpx=None, reg_states=tuple()):
+        _logpx = torch.zeros(x.shape[0], 1).to(x) if logpx is None else logpx
+        _, dim, im_size, _ = x.shape
+        out = []
+        for idx in range(len(self.transforms)):
+            x, _logpx, reg_states = self.transforms[idx].forward(x, _logpx, reg_states)
+            if idx <= len(self.transforms) - 1:
+                d = x.size(1) // 2
+                x, factor_out = x[:, :d], x[:, d:]
+            else:
+                # last layer, no factor out
+                factor_out = x
+            out.append(factor_out)
+        out = [o.view(o.size()[0], -1) for o in out]
+        out = torch.cat(out, 1)
+        # zeros = torch.zeros(out.size()[0], (im_size * im_size * dim) - out.size()[1])
+        # out = torch.cat((out, zeros), 1)
+        return out, _logpx, reg_states, x
 
     def _generate(self, z, logpz=None, reg_states=tuple()):
         z = z.view(z.shape[0], -1)
@@ -154,25 +172,26 @@ class ODENVP(nn.Module):
 
 class StackedCNFLayers(layers.SequentialFlow):
     def __init__(
-        self,
-        initial_size,
-        idims=(32,),
-        nonlinearity="softplus",
-        layer_type="concat",
-        div_samples=1,
-        squeeze=True,
-        init_layer=None,
-        n_blocks=1,
-        zero_last=True,
-        strides=None,
-        cnf_kwargs={},
+            self,
+            initial_size,
+            idims=(32,),
+            nonlinearity="softplus",
+            layer_type="concat",
+            div_samples=1,
+            squeeze=True,
+            init_layer=None,
+            n_blocks=1,
+            zero_last=True,
+            strides=None,
+            cnf_kwargs={},
     ):
         chain = []
         if init_layer is not None:
             chain.append(init_layer)
 
         def _make_odefunc(size):
-            net = ODEnet(idims, size, strides, True, layer_type=layer_type, nonlinearity=nonlinearity, zero_last_weight=zero_last)
+            net = ODEnet(idims, size, strides, True, layer_type=layer_type, nonlinearity=nonlinearity,
+                         zero_last_weight=zero_last)
             f = layers.ODEfunc(net, div_samples=div_samples)
             return f
 
