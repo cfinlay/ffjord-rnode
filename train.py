@@ -33,6 +33,7 @@ from torch.utils.data.distributed import DistributedSampler
 from celeb_dataset import CelebDataset
 from torch.nn import MSELoss
 
+
 SOLVERS = ["dopri5", "bdf", "rk4", "midpoint", 'adams', 'explicit_adams', 'adaptive_heun', 'bosh3']
 
 
@@ -102,7 +103,7 @@ def get_parser():
     )
 
     parser.add_argument("--resume", type=str, default=None, help='path to saved check point')
-    parser.add_argument("--save", type=str, default="experiments/cnf")
+    parser.add_argument("--save", type=str, default="experiments/celebahq")
     parser.add_argument("--val_freq", type=int, default=1)
     parser.add_argument("--log_freq", type=int, default=10)
     parser.add_argument('--validate', type=eval, default=False, choices=[True, False])
@@ -110,7 +111,7 @@ def get_parser():
     parser.add_argument('--distributed', action='store_true', help='Run distributed training. Default True')
     parser.add_argument('--dist-url', default='env://', type=str,
                         help='url used to set up distributed training')
-    parser.add_argument('--dist-backend', default='nccl', type=str, help='distributed backend')
+    parser.add_argument('--dist-backend', default='gloo', type=str, help='distributed backend')
     parser.add_argument('--local_rank', default=0, type=int,
                         help='Used for multi-process training. Can either be manually set ' +
                              'or automatically set by using \'python -m multiproc\'.')
@@ -126,6 +127,7 @@ def get_parser():
 
 
 cudnn.benchmark = True
+block = 2
 args = get_parser().parse_args()
 torch.manual_seed(args.seed)
 nvals = 2 ** args.nbits
@@ -175,9 +177,9 @@ def update_lr(optimizer, itr):
 #         out_width = in_width // downscale_factor
 
 
-def get_dataset(args):
+def get_dataset(args, device):
     trans = lambda im_size: tforms.Compose([tforms.Resize(im_size)])
-    block = 2
+    
     if args.data == "mnist":
         im_dim = 1
         im_size = 28 if args.imagesize is None else args.imagesize
@@ -230,31 +232,36 @@ def get_dataset(args):
             ])
         )
     data_shape = (im_dim, im_size, im_size)
-
+    
     def fast_collate(batch):
-
+        
         imgs = [img[0] for img in batch]
-        targets = torch.tensor([target[1] for target in batch], dtype=torch.int64)
-        w = imgs[0].size[0]
-        h = imgs[0].size[1]
-
-        tensor = torch.zeros((len(imgs), im_dim, im_size, im_size), dtype=torch.uint8)
+        targets = [target[1] for target in batch]
+        im_dim = imgs[0].shape[0]
+        w = imgs[0].shape[1]
+        h = imgs[0].shape[2]
+        
+        tensor = torch.zeros((len(imgs), im_dim, w, h), dtype=torch.float32)
         for i, img in enumerate(imgs):
-            nump_array = np.asarray(img, dtype=np.uint8)
-            tens = torch.from_numpy(nump_array)
-            if (nump_array.ndim < 3):
-                nump_array = np.expand_dims(nump_array, axis=-1)
-            nump_array = np.rollaxis(nump_array, 2)
+            nump_array = np.asarray(img, dtype=np.float32())/255.0
             tensor[i] += torch.from_numpy(nump_array)
+        
+        im_dim = targets[0].shape[0]
+        w = targets[0].shape[1]
+        h = targets[0].shape[2]
+        target_tensors = torch.zeros((len(imgs), im_dim, w, h), dtype=torch.float32)
 
-        return tensor, targets
+        for target in targets:
+            nump_array = np.asarray(target, dtype=np.float32())/255.0
+            target_tensors += torch.from_numpy(nump_array)
+        return tensor, target_tensors
 
     train_sampler = (DistributedSampler(train_set,
                                         num_replicas=env_world_size(), rank=env_rank()) if args.distributed
                      else None)
     train_loader = torch.utils.data.DataLoader(
         dataset=train_set, batch_size=16,  # shuffle=True,
-        num_workers=8, pin_memory=True, sampler=train_sampler)
+        num_workers=8, pin_memory=True, sampler=train_sampler, collate_fn=fast_collate)
 
     test_sampler = (DistributedSampler(test_set,
                                        num_replicas=env_world_size(), rank=env_rank(),
@@ -262,7 +269,7 @@ def get_dataset(args):
                     else None)
     test_loader = torch.utils.data.DataLoader(
         dataset=test_set, batch_size=16,  # shuffle=False,
-        num_workers=8, pin_memory=True, sampler=test_sampler
+        num_workers=8, pin_memory=True, sampler=test_sampler, collate_fn=fast_collate
     )
 
     return train_loader, test_loader, data_shape
@@ -287,14 +294,14 @@ def compute_bits_per_dim(x, model):
 def create_model(args, data_shape, regularization_fns):
     hidden_dims = tuple(map(int, args.dims.split(",")))
     strides = tuple(map(int, args.strides.split(",")))
-    print("number of blocks: ", args.num_blocks)
-    print("hidden_dims: ", hidden_dims)
-    print("div_samples", args.div_samples)
-    print("strides ", strides)
-    print("squeeze_first ", args.squeeze_first)
-    print("non linearity ", args.nonlinearity)
-    print("layer_type ", args.layer_type)
-    print("zero_last ", args.zero_last)
+    #print("number of blocks: ", args.num_blocks)
+    #print("hidden_dims: ", hidden_dims)
+    #print("div_samples", args.div_samples)
+    #print("strides ", strides)
+    #print("squeeze_first ", args.squeeze_first)
+    #print("non linearity ", args.nonlinearity)
+    #print("layer_type ", args.layer_type)
+    #print("zero_last ", args.zero_last)
     model = odenvp.ODENVP(
         (args.batch_size, *data_shape),
         n_blocks=args.num_blocks,
@@ -325,19 +332,19 @@ def main():
 
     if args.distributed:
         if write_log: logger.info('Distributed initializing process group')
-        torch.cuda.set_device(args.local_rank)
+        torch.cuda.set_device("cuda:%d"%torch.cuda.current_device())
         distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                        world_size=dist_utils.env_world_size(), rank=env_rank())
         assert (dist_utils.env_world_size() == distributed.get_world_size())
         if write_log: logger.info("Distributed: success (%d/%d)" % (args.local_rank, distributed.get_world_size()))
-
+  
     # get deivce
-    # device = torch.device("cuda:%d"%torch.cuda.current_device() if torch.cuda.is_available() else "cpu")
-    device = "cpu"
+    device = torch.device("cuda:%d"%torch.cuda.current_device() if torch.cuda.is_available() else "cpu")
+    #device = "cpu"
     cvt = lambda x: x.type(torch.float32).to(device, non_blocking=True)
 
     # load dataset
-    train_loader, test_loader, data_shape = get_dataset(args)
+    train_loader, test_loader, data_shape = get_dataset(args, device)
 
     trainlog = os.path.join(args.save, 'training.csv')
     testlog = os.path.join(args.save, 'test.csv')
@@ -349,6 +356,7 @@ def main():
     regularization_fns, regularization_coeffs = create_regularization_fns(args)
     model = create_model(args, data_shape, regularization_fns).cuda()
     # model = model.cuda()
+    args.distributed = False
     if args.distributed: model = dist_utils.DDP(model,
                                                 device_ids=[args.local_rank],
                                                 output_device=args.local_rank)
@@ -419,6 +427,7 @@ def main():
         dist_utils.sum_tensor(torch.tensor([1.0]).float().cuda())
 
     mse_loss = MSELoss()
+    print("number of batches:", length_of_trainloader // train_loader.batch_size)
     for epoch in range(begin_epoch, args.num_epochs + 1):
         if not args.validate:
             model.train()
@@ -429,8 +438,11 @@ def main():
                 number_of_batches = length_of_trainloader // train_loader.batch_size
                 for i in range(number_of_batches):
                     x, label = next(iter(train_loader))
-                    x, label = x.cuda(), label.cuda()
-                    print(type(x))
+                    x = x.to(device)
+                    label = label.to(device)
+                    
+                    # x, label = x.cuda(), label.cuda()
+                    # print(type(x))
                     start = time.time()
                     update_lr(optimizer, itr)
                     optimizer.zero_grad()
@@ -446,6 +458,7 @@ def main():
                         raise ValueError('model returned inf during training')
 
                     loss = bpd
+                    
                     loss += mse_loss(out, label)
                     if regularization_coeffs:
                         reg_loss = sum(
@@ -475,7 +488,8 @@ def main():
                                             *reg_states]).float().cuda()
 
                     rv = tuple(torch.tensor(0.).cuda() for r in reg_states)
-
+                    
+                    
                     total_gpus, batch_total, r_loss, r_bpd, r_nfe, r_grad_norm, *rv = dist_utils.sum_tensor(
                         metrics).cpu().numpy()
 
@@ -531,11 +545,12 @@ def main():
             utils.makedirs(args.save)
             torch.save({
                 "args": args,
-                "state_dict": model.module.state_dict() if torch.cuda.is_available() else model.state_dict(),
+                "state_dict": model.state_dict() if torch.cuda.is_available() else model.state_dict(),
                 "optim_state_dict": optimizer.state_dict(),
                 "fixed_z": fixed_z.cpu()
-            }, os.path.join(args.save, "checkpt.pth"))
+            }, os.path.join(args.save, "checkpt_"+str(block)+".pth"))
         if epoch % args.val_freq == 0 or args.validate:
+            print("validation")
             with open(testlog, 'a') as f:
                 if write_log: csvlogger = csv.DictWriter(f, testcolumns)
                 with torch.no_grad():
@@ -583,8 +598,8 @@ def main():
 
                     if loss < best_loss and args.local_rank == 0:
                         best_loss = loss
-                        shutil.copyfile(os.path.join(args.save, "checkpt.pth"),
-                                        os.path.join(args.save, "best.pth"))
+                        shutil.copyfile(os.path.join(args.save, "checkpt"+ str(block) +".pth"),
+                                        os.path.join(args.save, "best"+ str(block) +".pth"))
 
             # visualize samples and density
             if write_log:

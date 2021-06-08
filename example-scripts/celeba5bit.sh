@@ -12,7 +12,7 @@ python -m torch.distributed.launch \
   --nproc_per_node=$NUM_GPUS --nnodes=1 --node_rank=0 \
   ../train.py --data $DATA \
   --nbits 5 \
-  --log_freq 1 \
+  --log_freq 100 \
   --datadir $DATADIR \
   --batch_size 64 \
   --test_batch_size 3 \
@@ -23,3 +23,4 @@ python -m torch.distributed.launch \
   --alpha 0.05 \
   --test_solver dopri5 --test_atol 1e-5 --test_rtol 1e-5 \
   --solver "rk4" \
+  --distributed \

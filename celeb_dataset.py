@@ -28,21 +28,20 @@ class CelebDataset(Dataset):
 
         img_name = os.path.join(self.root_dir,
                                 self.training_files_names[idx])
-        loaded = np.load(img_name+"_train.npz")
-        train_image = torch.from_numpy(loaded["a"])
+        loaded_ = np.load(img_name+"_train.npz")
+        train_image = loaded_["a"]
 
         loaded = np.load(img_name + "_label.npz")
-        label = torch.from_numpy(loaded["a"])
-
+        label = loaded["a"]
         return train_image, label
 
 
 if __name__ == "__main__":
-    train_set = CelebDataset("./data/CelebAMask-HQ/training_sets/2/", transform=tforms.Compose([tforms.ToTensor()]))
+    train_set = CelebDataset("./data/CelebAMask-HQ/training_sets/2/", )
     train_loader = torch.utils.data.DataLoader(
         dataset=train_set, batch_size=8,  # shuffle=True,
         num_workers=8, pin_memory=True)
 
     x,y = next(iter(train_loader))
-
+    print(x.shape, y.shape)
     test_set = CelebDataset("./data/CelebAMask-HQ/test_sets/3/",  transform=tforms.Compose([tforms.ToTensor()]))

@@ -9,7 +9,7 @@ dims: 64,64,64
 directional_penalty: null
 dist_backend: nccl
 dist_url: env://
-distributed: true
+distributed: false
 div_samples: 1
 divergence_fn: approximate
 first_step: 0.166667
@@ -25,7 +25,7 @@ nbits: 8
 nonlinearity: softplus
 num_blocks: 2
 num_epochs: 100
-nworkers: 4
+nworkers: 8
 optimizer: adam
 resume: null
 rtol: 1.0e-05
