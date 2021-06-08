@@ -12,11 +12,11 @@ python -m torch.distributed.launch \
   --nproc_per_node=$NUM_GPUS --nnodes=1 --node_rank=0 \
   ../train.py --data $DATA \
   --nbits 5 \
-  --log_freq 100 \
+  --log_freq 10 \
   --datadir $DATADIR \
-  --batch_size 64 \
-  --test_batch_size 3 \
-  --num_epochs 16 \
+  --batch_size 512 \
+  --test_batch_size 128 \
+  --num_epochs 30 \
   --save $SAVE \
   --kinetic-energy $KE \
   --jacobian-norm2 $JF \

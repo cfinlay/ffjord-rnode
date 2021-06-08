@@ -128,6 +128,7 @@ def get_parser():
 
 cudnn.benchmark = True
 block = 2
+downscale_factor=2
 args = get_parser().parse_args()
 torch.manual_seed(args.seed)
 nvals = 2 ** args.nbits
@@ -260,7 +261,7 @@ def get_dataset(args, device):
                                         num_replicas=env_world_size(), rank=env_rank()) if args.distributed
                      else None)
     train_loader = torch.utils.data.DataLoader(
-        dataset=train_set, batch_size=16,  # shuffle=True,
+        dataset=train_set, batch_size=args.batch_size,  # shuffle=True,
         num_workers=8, pin_memory=True, sampler=train_sampler, collate_fn=fast_collate)
 
     test_sampler = (DistributedSampler(test_set,
@@ -268,7 +269,7 @@ def get_dataset(args, device):
                                        shuffle=False) if args.distributed
                     else None)
     test_loader = torch.utils.data.DataLoader(
-        dataset=test_set, batch_size=16,  # shuffle=False,
+        dataset=test_set, batch_size=args.test_batch_size,  # shuffle=False,
         num_workers=8, pin_memory=True, sampler=test_sampler, collate_fn=fast_collate
     )
 
@@ -427,14 +428,18 @@ def main():
         dist_utils.sum_tensor(torch.tensor([1.0]).float().cuda())
 
     mse_loss = MSELoss()
+    length_of_trainloader = len(train_loader.dataset)
     print("number of batches:", length_of_trainloader // train_loader.batch_size)
+    print("best loss", best_loss)
     for epoch in range(begin_epoch, args.num_epochs + 1):
+        print("epoch number : ",epoch)
+        itr = 0
         if not args.validate:
             model.train()
 
             with open(trainlog, 'a') as f:
                 if write_log: csvlogger = csv.DictWriter(f, traincolumns)
-                length_of_trainloader = len(train_loader.dataset)
+                
                 number_of_batches = length_of_trainloader // train_loader.batch_size
                 for i in range(number_of_batches):
                     x, label = next(iter(train_loader))
@@ -550,7 +555,6 @@ def main():
                 "fixed_z": fixed_z.cpu()
             }, os.path.join(args.save, "checkpt_"+str(block)+".pth"))
         if epoch % args.val_freq == 0 or args.validate:
-            print("validation")
             with open(testlog, 'a') as f:
                 if write_log: csvlogger = csv.DictWriter(f, testcolumns)
                 with torch.no_grad():
@@ -564,8 +568,23 @@ def main():
                     for i, (x, y) in enumerate(test_loader):
                         sh = x.shape
                         x = shift(cvt(x), nbits=args.nbits)
+                        
                         loss, (x, z), _, out = compute_bits_per_dim(x, model)
-                        dist = (x.view(x.size(0), -1) - z).pow(2).mean(dim=-1).mean()
+                        batch_size, in_channels, in_height, in_width = x.size()
+                        out_channels = in_channels * (downscale_factor ** 2)
+            
+                        out_height = in_height // downscale_factor
+                        out_width = in_width // downscale_factor
+                        input_view = x.contiguous().view(
+                            batch_size, in_channels, out_height, downscale_factor, out_width, downscale_factor
+                        )
+            
+                        output = input_view.permute(0, 1, 3, 5, 2, 4).contiguous()
+                        output = output.view(batch_size, out_channels, out_height, out_width)
+                        d = output.size(1) // 2
+                        output = output[:, d:]
+                        
+                        dist = (output.view(output.size(0), -1) - z).pow(2).mean(dim=-1).mean()
                         meandist = i / (i + 1) * dist + meandist / (i + 1)
                         lossmean = i / (i + 1) * lossmean + loss / (i + 1)
 
@@ -598,18 +617,18 @@ def main():
 
                     if loss < best_loss and args.local_rank == 0:
                         best_loss = loss
-                        shutil.copyfile(os.path.join(args.save, "checkpt"+ str(block) +".pth"),
-                                        os.path.join(args.save, "best"+ str(block) +".pth"))
+                        shutil.copyfile(os.path.join(args.save, "checkpt_"+ str(block) +".pth"),
+                                        os.path.join(args.save, "best_"+ str(block) +".pth"))
 
             # visualize samples and density
-            if write_log:
-                with torch.no_grad():
-                    fig_filename = os.path.join(args.save, "figs", "{:04d}.jpg".format(epoch))
-                    utils.makedirs(os.path.dirname(fig_filename))
-                    generated_samples, _, _ = model(fixed_z, reverse=True)
-                    generated_samples = generated_samples.view(-1, *data_shape)
-                    nb = int(np.ceil(np.sqrt(float(fixed_z.size(0)))))
-                    save_image(unshift(generated_samples, nbits=args.nbits), fig_filename, nrow=nb)
+            #if write_log:
+                #with torch.no_grad():
+                    #fig_filename = os.path.join(args.save, "figs", "{:04d}.jpg".format(epoch))
+                    #utils.makedirs(os.path.dirname(fig_filename))
+                    #generated_samples, _, _ = model(fixed_z, reverse=True)
+                    #generated_samples = generated_samples.view(-1, *data_shape)
+                    #nb = int(np.ceil(np.sqrt(float(fixed_z.size(0)))))
+                    #save_image(unshift(generated_samples, nbits=args.nbits), fig_filename, nrow=nb)
             if args.validate:
                 break
 
