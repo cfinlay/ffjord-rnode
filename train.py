@@ -241,6 +241,7 @@ def get_dataset(args, device):
         
         imgs = [img[0] for img in batch]
         targets = [target[1] for target in batch]
+        print(type(imgs[0]))
         im_dim = imgs[0].shape[0]
         w = imgs[0].shape[1]
         h = imgs[0].shape[2]
