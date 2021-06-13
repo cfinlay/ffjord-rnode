@@ -127,7 +127,7 @@ def get_parser():
 
 
 cudnn.benchmark = True
-block = 2
+block = 1
 downscale_factor=2
 args = get_parser().parse_args()
 torch.manual_seed(args.seed)
@@ -206,6 +206,9 @@ def get_dataset(args, device):
         if block == 2:
             im_dim = 12
             im_size = 8
+        if block == 1:
+            im_dim = 6
+            im_size = 16
         train_set = CelebDataset(root="/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/training_sets/" + str(block))
         test_set = CelebDataset(root="/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/test_sets/" + str(block))
     elif args.data == 'imagenet64':
@@ -295,14 +298,6 @@ def compute_bits_per_dim(x, model):
 def create_model(args, data_shape, regularization_fns):
     hidden_dims = tuple(map(int, args.dims.split(",")))
     strides = tuple(map(int, args.strides.split(",")))
-    #print("number of blocks: ", args.num_blocks)
-    #print("hidden_dims: ", hidden_dims)
-    #print("div_samples", args.div_samples)
-    #print("strides ", strides)
-    #print("squeeze_first ", args.squeeze_first)
-    #print("non linearity ", args.nonlinearity)
-    #print("layer_type ", args.layer_type)
-    #print("zero_last ", args.zero_last)
     model = odenvp.ODENVP(
         (args.batch_size, *data_shape),
         n_blocks=args.num_blocks,

@@ -37,7 +37,7 @@ class CelebDataset(Dataset):
 
 
 if __name__ == "__main__":
-    train_set = CelebDataset("./data/CelebAMask-HQ/training_sets/2/", )
+    train_set = CelebDataset("./data/CelebAMask-HQ/training_sets/1/", )
     train_loader = torch.utils.data.DataLoader(
         dataset=train_set, batch_size=8,  # shuffle=True,
         num_workers=8, pin_memory=True)
