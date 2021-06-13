@@ -22,6 +22,19 @@ class CelebDataset(Dataset):
     def __len__(self):
         return len(self.training_files_names)
 
+    def getitem(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+
+        img_name = os.path.join(self.root_dir,
+                                self.training_files_names[idx])
+        loaded_ = np.load(img_name+"_train.npz")
+        train_image = loaded_["a"]
+
+        loaded = np.load(img_name + "_label.npz")
+        label = loaded["a"]
+        return train_image, label
+
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()

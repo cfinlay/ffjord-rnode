@@ -210,6 +210,10 @@ def get_dataset(args, device):
             im_dim = 6
             im_size = 16
         train_set = CelebDataset(root="/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/training_sets/" + str(block))
+        x, label = train_set.getitem(0)
+        print("----------")
+        print("dslkfgnsjg ",x.shape, label.shape)
+        print("----------")
         test_set = CelebDataset(root="/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/test_sets/" + str(block))
     elif args.data == 'imagenet64':
         im_dim = 3
