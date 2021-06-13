@@ -238,13 +238,12 @@ def get_dataset(args, device):
     data_shape = (im_dim, im_size, im_size)
     
     def fast_collate(batch):
-        
         imgs = [img[0] for img in batch]
         targets = [target[1] for target in batch]
-        print(type(imgs[0]))
-        im_dim = imgs[0].shape[0]
-        w = imgs[0].shape[1]
-        h = imgs[0].shape[2]
+        image = np.asarray(imgs[0])
+        im_dim = image.shape[0]
+        w = image.shape[1]
+        h = image.shape[2]
         
         tensor = torch.zeros((len(imgs), im_dim, w, h), dtype=torch.float32)
         for i, img in enumerate(imgs):
