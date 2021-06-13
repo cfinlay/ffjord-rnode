@@ -33,7 +33,6 @@ from torch.utils.data.distributed import DistributedSampler
 from celeb_dataset import CelebDataset
 from torch.nn import MSELoss
 
-
 SOLVERS = ["dopri5", "bdf", "rk4", "midpoint", 'adams', 'explicit_adams', 'adaptive_heun', 'bosh3']
 
 
@@ -128,7 +127,7 @@ def get_parser():
 
 cudnn.benchmark = True
 block = 1
-downscale_factor=2
+downscale_factor = 2
 args = get_parser().parse_args()
 torch.manual_seed(args.seed)
 nvals = 2 ** args.nbits
@@ -180,7 +179,7 @@ def update_lr(optimizer, itr):
 
 def get_dataset(args, device):
     trans = lambda im_size: tforms.Compose([tforms.Resize(im_size)])
-    
+
     if args.data == "mnist":
         im_dim = 1
         im_size = 28 if args.imagesize is None else args.imagesize
@@ -210,9 +209,6 @@ def get_dataset(args, device):
             im_dim = 6
             im_size = 16
         train_set = CelebDataset(root="/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/training_sets/" + str(block))
-        x, label = train_set.getitem(0)
-        print(x.shape, label.shape)
-        bhjkbubkjb
         test_set = CelebDataset(root="/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/test_sets/" + str(block))
     elif args.data == 'imagenet64':
         im_dim = 3
@@ -239,28 +235,26 @@ def get_dataset(args, device):
             ])
         )
     data_shape = (im_dim, im_size, im_size)
-    
+
     def fast_collate(batch):
         imgs = [img[0] for img in batch]
         targets = [target[1] for target in batch]
-        image = np.squeeze(np.asarray(imgs[0]))
-        print(image.shape)
-        im_dim = image.shape[0]
-        w = image.shape[1]
-        h = image.shape[2]
-        
+        im_dim = imgs[0].shape[0]
+        w = imgs[0].shape[1]
+        h = imgs[0].shape[2]
+
         tensor = torch.zeros((len(imgs), im_dim, w, h), dtype=torch.float32)
         for i, img in enumerate(imgs):
-            nump_array = np.asarray(img, dtype=np.float32())/255.0
+            nump_array = np.asarray(img, dtype=np.float32()) / 255.0
             tensor[i] += torch.from_numpy(nump_array)
-        
+
         im_dim = targets[0].shape[0]
         w = targets[0].shape[1]
         h = targets[0].shape[2]
         target_tensors = torch.zeros((len(imgs), im_dim, w, h), dtype=torch.float32)
 
         for target in targets:
-            nump_array = np.asarray(target, dtype=np.float32())/255.0
+            nump_array = np.asarray(target, dtype=np.float32()) / 255.0
             target_tensors += torch.from_numpy(nump_array)
         return tensor, target_tensors
 
@@ -332,15 +326,15 @@ def main():
 
     if args.distributed:
         if write_log: logger.info('Distributed initializing process group')
-        torch.cuda.set_device("cuda:%d"%torch.cuda.current_device())
+        torch.cuda.set_device("cuda:%d" % torch.cuda.current_device())
         distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                        world_size=dist_utils.env_world_size(), rank=env_rank())
         assert (dist_utils.env_world_size() == distributed.get_world_size())
         if write_log: logger.info("Distributed: success (%d/%d)" % (args.local_rank, distributed.get_world_size()))
-  
+
     # get deivce
-    device = torch.device("cuda:%d"%torch.cuda.current_device() if torch.cuda.is_available() else "cpu")
-    #device = "cpu"
+    device = torch.device("cuda:%d" % torch.cuda.current_device() if torch.cuda.is_available() else "cpu")
+    # device = "cpu"
     cvt = lambda x: x.type(torch.float32).to(device, non_blocking=True)
 
     # load dataset
@@ -431,20 +425,20 @@ def main():
     print("number of batches:", length_of_trainloader // train_loader.batch_size)
     print("best loss", best_loss)
     for epoch in range(begin_epoch, args.num_epochs + 1):
-        print("epoch number : ",epoch)
+        print("epoch number : ", epoch)
         itr = 0
         if not args.validate:
             model.train()
 
             with open(trainlog, 'a') as f:
                 if write_log: csvlogger = csv.DictWriter(f, traincolumns)
-                
+
                 number_of_batches = length_of_trainloader // train_loader.batch_size
                 for i in range(number_of_batches):
                     x, label = next(iter(train_loader))
                     x = x.to(device)
                     label = label.to(device)
-                    
+
                     # x, label = x.cuda(), label.cuda()
                     # print(type(x))
                     start = time.time()
@@ -462,7 +456,7 @@ def main():
                         raise ValueError('model returned inf during training')
 
                     loss = bpd
-                    
+
                     loss += mse_loss(out, label)
                     if regularization_coeffs:
                         reg_loss = sum(
@@ -492,8 +486,7 @@ def main():
                                             *reg_states]).float().cuda()
 
                     rv = tuple(torch.tensor(0.).cuda() for r in reg_states)
-                    
-                    
+
                     total_gpus, batch_total, r_loss, r_bpd, r_nfe, r_grad_norm, *rv = dist_utils.sum_tensor(
                         metrics).cpu().numpy()
 
@@ -552,7 +545,7 @@ def main():
                 "state_dict": model.state_dict() if torch.cuda.is_available() else model.state_dict(),
                 "optim_state_dict": optimizer.state_dict(),
                 "fixed_z": fixed_z.cpu()
-            }, os.path.join(args.save, "checkpt_"+str(block)+".pth"))
+            }, os.path.join(args.save, "checkpt_" + str(block) + ".pth"))
         if epoch % args.val_freq == 0 or args.validate:
             with open(testlog, 'a') as f:
                 if write_log: csvlogger = csv.DictWriter(f, testcolumns)
@@ -567,22 +560,22 @@ def main():
                     for i, (x, y) in enumerate(test_loader):
                         sh = x.shape
                         x = shift(cvt(x), nbits=args.nbits)
-                        
+
                         loss, (x, z), _, out = compute_bits_per_dim(x, model)
                         batch_size, in_channels, in_height, in_width = x.size()
                         out_channels = in_channels * (downscale_factor ** 2)
-            
+
                         out_height = in_height // downscale_factor
                         out_width = in_width // downscale_factor
                         input_view = x.contiguous().view(
                             batch_size, in_channels, out_height, downscale_factor, out_width, downscale_factor
                         )
-            
+
                         output = input_view.permute(0, 1, 3, 5, 2, 4).contiguous()
                         output = output.view(batch_size, out_channels, out_height, out_width)
                         d = output.size(1) // 2
                         output = output[:, d:]
-                        
+
                         dist = (output.view(output.size(0), -1) - z).pow(2).mean(dim=-1).mean()
                         meandist = i / (i + 1) * dist + meandist / (i + 1)
                         lossmean = i / (i + 1) * lossmean + loss / (i + 1)
@@ -616,18 +609,18 @@ def main():
 
                     if loss < best_loss and args.local_rank == 0:
                         best_loss = loss
-                        shutil.copyfile(os.path.join(args.save, "checkpt_"+ str(block) +".pth"),
-                                        os.path.join(args.save, "best_"+ str(block) +".pth"))
+                        shutil.copyfile(os.path.join(args.save, "checkpt_" + str(block) + ".pth"),
+                                        os.path.join(args.save, "best_" + str(block) + ".pth"))
 
             # visualize samples and density
-            #if write_log:
-                #with torch.no_grad():
-                    #fig_filename = os.path.join(args.save, "figs", "{:04d}.jpg".format(epoch))
-                    #utils.makedirs(os.path.dirname(fig_filename))
-                    #generated_samples, _, _ = model(fixed_z, reverse=True)
-                    #generated_samples = generated_samples.view(-1, *data_shape)
-                    #nb = int(np.ceil(np.sqrt(float(fixed_z.size(0)))))
-                    #save_image(unshift(generated_samples, nbits=args.nbits), fig_filename, nrow=nb)
+            # if write_log:
+            # with torch.no_grad():
+            # fig_filename = os.path.join(args.save, "figs", "{:04d}.jpg".format(epoch))
+            # utils.makedirs(os.path.dirname(fig_filename))
+            # generated_samples, _, _ = model(fixed_z, reverse=True)
+            # generated_samples = generated_samples.view(-1, *data_shape)
+            # nb = int(np.ceil(np.sqrt(float(fixed_z.size(0)))))
+            # save_image(unshift(generated_samples, nbits=args.nbits), fig_filename, nrow=nb)
             if args.validate:
                 break
 
