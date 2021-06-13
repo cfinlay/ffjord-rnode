@@ -240,7 +240,8 @@ def get_dataset(args, device):
     def fast_collate(batch):
         imgs = [img[0] for img in batch]
         targets = [target[1] for target in batch]
-        image = np.asarray(imgs[0])
+        image = np.squeeze(np.asarray(imgs[0]))
+        print(image.shape)
         im_dim = image.shape[0]
         w = image.shape[1]
         h = image.shape[2]
