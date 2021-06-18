@@ -32,15 +32,20 @@ class ODENVP(nn.Module):
             div_samples=1,
             alpha=0.05,
             cnf_kwargs=None,
+            training_complete_model=False,
+            training_last_layer=False
     ):
         super(ODENVP, self).__init__()
         if squeeze_first:
             bsz, c, w, h = input_size
             c, w, h = c * 4, w // 2, h // 2
             input_size = bsz, c, w, h
-
-        # self.n_scale = min(n_scale, self._calc_n_scale(input_size))
-        self.n_scale = 1
+        
+        if training_complete_model:    
+            self.n_scale = min(n_scale, self._calc_n_scale(input_size))
+        else:
+            self.n_scale = 1
+    
         self.n_blocks = n_blocks
         self.intermediate_dims = intermediate_dims
         self.layer_type = layer_type
@@ -52,14 +57,41 @@ class ODENVP(nn.Module):
         self.alpha = alpha
         self.squeeze_first = squeeze_first
         self.cnf_kwargs = cnf_kwargs if cnf_kwargs else {}
-
+        self.use_mse = not(training_complete_model | training_last_layer)
         if not self.n_scale > 0:
             raise ValueError('Could not compute number of scales for input of' 'size (%d,%d,%d,%d)' % input_size)
-
-        self.transforms = self._build_net(input_size)
+        
+        if training_complete_model:
+            self.transforms = self.build_net_for_complete(input_size)
+        else:
+        
+            self.transforms = self._build_net(input_size)
 
         self.dims = [o[1:] for o in self.calc_output_size(input_size)]
 
+    def build_net_for_complete(self, input_size):
+        batch, c,h,w = input_size
+        models = []
+        
+            
+        model = self._build_net((batch, c, h, w))
+        final_state_dict = {}
+        skip_index = len("transforms.")
+        for i in range(self.n_scale):
+            
+            state_dict = torch.load("/HPS/CNF/work/ffjord-rnode/experiments/celebahq/example/best_"+ str(i)+".pth")["state_dict"]
+            
+            for key in state_dict.keys():
+                final_state_dict[str(i) + key[skip_index+1:]]= state_dict[key]
+        
+        model_dict_keys = list(model.state_dict().keys())
+        modified_state_dict ={}
+        for idx,key in enumerate(final_state_dict.keys()):
+            modified_state_dict[model_dict_keys[idx]] = final_state_dict[key]
+        
+        model.load_state_dict(modified_state_dict)
+        return model
+            
     def _build_net(self, input_size):
         _, c, h, w = input_size
         transforms = []
@@ -116,7 +148,10 @@ class ODENVP(nn.Module):
         else:
             if self.squeeze_first:
                 x = squeeze(x)
-            return self._logdensity_single(x, logpx, reg_states)
+            if self.use_mse:
+                return self._logdensity_single(x, logpx, reg_states)
+            else:
+                return self._logdensity(x, logpx, reg_states)
 
     def _logdensity(self, x, logpx=None, reg_states=tuple()):
         _logpx = torch.zeros(x.shape[0], 1).to(x) if logpx is None else logpx
@@ -149,8 +184,6 @@ class ODENVP(nn.Module):
             out.append(factor_out)
         out = [o.view(o.size()[0], -1) for o in out]
         out = torch.cat(out, 1)
-        # zeros = torch.zeros(out.size()[0], (im_size * im_size * dim) - out.size()[1])
-        # out = torch.cat((out, zeros), 1)
         return out, _logpx, reg_states, x
 
     def _generate(self, z, logpz=None, reg_states=tuple()):

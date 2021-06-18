@@ -28,9 +28,11 @@ from train_misc import create_regularization_fns, get_regularization, append_reg
 from train_misc import append_regularization_keys_header, append_regularization_csv_dict
 
 import dist_utils
+import torchvision.transforms as tforms
 from dist_utils import env_world_size, env_rank
 from torch.utils.data.distributed import DistributedSampler
 from celeb_dataset import CelebDataset
+from celebmaindataset import CelebMainDataset
 from torch.nn import MSELoss
 
 SOLVERS = ["dopri5", "bdf", "rk4", "midpoint", 'adams', 'explicit_adams', 'adaptive_heun', 'bosh3']
@@ -126,7 +128,10 @@ def get_parser():
 
 
 cudnn.benchmark = True
-block = 1
+training_complete_model = True
+training_last_layer = False
+use_mse = not(training_complete_model | training_last_layer)
+block = 0
 downscale_factor = 2
 args = get_parser().parse_args()
 torch.manual_seed(args.seed)
@@ -208,8 +213,28 @@ def get_dataset(args, device):
         if block == 1:
             im_dim = 6
             im_size = 16
-        train_set = CelebDataset(root="/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/training_sets/" + str(block))
-        test_set = CelebDataset(root="/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/test_sets/" + str(block))
+        if block == 0:
+            im_dim = 3
+            im_size = 32
+        if block == 3:
+            im_dim = 24
+            im_size = 4
+        if training_complete_model:
+            im_dim = 3
+            im_size = 32
+        if not training_complete_model:
+            train_set = CelebDataset(root="/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/training_sets/" + str(block))
+            test_set = CelebDataset(root="/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/test_sets/" + str(block))
+        else:
+            train_set = CelebMainDataset(root="/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/training/", 
+                                         transforms=tforms.Compose([tforms.ToPILImage(), tforms.Resize(32), tforms.RandomHorizontalFlip(), tforms.ToTensor()]))
+            test_set = CelebMainDataset(root="/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/test/", transforms=tforms.Compose([
+                                 tforms.ToPILImage(),
+                                 tforms.Resize(32),
+                                 tforms.RandomHorizontalFlip(),
+                                 tforms.ToTensor()
+                             ]))
+
     elif args.data == 'imagenet64':
         im_dim = 3
         if args.imagesize != 64:
@@ -237,6 +262,7 @@ def get_dataset(args, device):
     data_shape = (im_dim, im_size, im_size)
 
     def fast_collate(batch):
+    
         imgs = [img[0] for img in batch]
         targets = [target[1] for target in batch]
         im_dim = imgs[0].shape[0]
@@ -247,7 +273,7 @@ def get_dataset(args, device):
         for i, img in enumerate(imgs):
             nump_array = np.asarray(img, dtype=np.float32()) / 255.0
             tensor[i] += torch.from_numpy(nump_array)
-
+            
         im_dim = targets[0].shape[0]
         w = targets[0].shape[1]
         h = targets[0].shape[2]
@@ -279,9 +305,10 @@ def get_dataset(args, device):
 
 def compute_bits_per_dim(x, model):
     zero = torch.zeros(x.shape[0], 1).to(x)
-
-    z, delta_logp, reg_states, out = model(x, zero)  # run model forward
-
+    if use_mse:
+        z, delta_logp, reg_states, out = model(x, zero)  # run model forward
+    else:
+        z, delta_logp, reg_states = model(x, zero)
     reg_states = tuple(torch.mean(rs) for rs in reg_states)
 
     logpz = standard_normal_logprob(z).view(z.shape[0], -1).sum(1, keepdim=True)  # logp(z)
@@ -289,9 +316,10 @@ def compute_bits_per_dim(x, model):
 
     logpx_per_dim = torch.sum(logpx) / x.nelement()  # averaged over batches
     bits_per_dim = -(logpx_per_dim - np.log(nvals)) / np.log(2)
-
-    return bits_per_dim, (x, z), reg_states, out
-
+    if use_mse:
+        return bits_per_dim, (x, z), reg_states, out
+    return bits_per_dim, (x, z), reg_states
+        
 
 def create_model(args, data_shape, regularization_fns):
     hidden_dims = tuple(map(int, args.dims.split(",")))
@@ -308,10 +336,32 @@ def create_model(args, data_shape, regularization_fns):
         zero_last=args.zero_last,
         alpha=args.alpha,
         cnf_kwargs={"T": args.time_length, "train_T": args.train_T, "regularization_fns": regularization_fns},
+        training_complete_model=training_complete_model,
+        training_last_layer=training_last_layer
     )
     print("model created ...")
     return model
 
+def create_model_complete(args, data_shape, regularization_fns):
+    hidden_dims = tuple(map(int, args.dims.split(",")))
+    strides = tuple(map(int, args.strides.split(",")))
+    model = odenvp.ODENVP(
+        (args.batch_size, *data_shape),
+        n_blocks=args.num_blocks,
+        intermediate_dims=hidden_dims,
+        div_samples=args.div_samples,
+        strides=strides,
+        squeeze_first=args.squeeze_first,
+        nonlinearity=args.nonlinearity,
+        layer_type=args.layer_type,
+        zero_last=args.zero_last,
+        alpha=args.alpha,
+        cnf_kwargs={"T": args.time_length, "train_T": args.train_T, "regularization_fns": regularization_fns},
+        training_complete_model=training_complete_model,
+        training_last_layer=training_last_layer
+    )
+    print("model created ...")
+    return model
 
 def main():
     if write_log:
@@ -348,7 +398,10 @@ def main():
 
     # build model
     regularization_fns, regularization_coeffs = create_regularization_fns(args)
-    model = create_model(args, data_shape, regularization_fns).cuda()
+    if not training_complete_model:
+        model = create_model(args, data_shape, regularization_fns).cuda()
+    else:
+        model = create_model_complete(args, data_shape, regularization_fns).cuda()
     # model = model.cuda()
     args.distributed = False
     if args.distributed: model = dist_utils.DDP(model,
@@ -449,15 +502,18 @@ def main():
                     x = add_noise(cvt(x), nbits=args.nbits)
                     # x = x.clamp_(min=0, max=1)
                     # compute loss
-                    bpd, (x, z), reg_states, out = compute_bits_per_dim(x, model)
+                    if use_mse:
+                        bpd, (x, z), reg_states, out = compute_bits_per_dim(x, model)
+                    else:
+                        bpd, (x, z), reg_states = compute_bits_per_dim(x, model)
                     if np.isnan(bpd.data.item()):
                         raise ValueError('model returned nan during training')
                     elif np.isinf(bpd.data.item()):
                         raise ValueError('model returned inf during training')
 
                     loss = bpd
-
-                    loss += mse_loss(out, label)
+                    if use_mse:
+                        loss += mse_loss(out, label)
                     if regularization_coeffs:
                         reg_loss = sum(
                             reg_state * coeff for reg_state, coeff in zip(reg_states, regularization_coeffs) if
@@ -560,23 +616,28 @@ def main():
                     for i, (x, y) in enumerate(test_loader):
                         sh = x.shape
                         x = shift(cvt(x), nbits=args.nbits)
-
-                        loss, (x, z), _, out = compute_bits_per_dim(x, model)
-                        batch_size, in_channels, in_height, in_width = x.size()
-                        out_channels = in_channels * (downscale_factor ** 2)
-
-                        out_height = in_height // downscale_factor
-                        out_width = in_width // downscale_factor
-                        input_view = x.contiguous().view(
-                            batch_size, in_channels, out_height, downscale_factor, out_width, downscale_factor
-                        )
-
-                        output = input_view.permute(0, 1, 3, 5, 2, 4).contiguous()
-                        output = output.view(batch_size, out_channels, out_height, out_width)
-                        d = output.size(1) // 2
-                        output = output[:, d:]
-
-                        dist = (output.view(output.size(0), -1) - z).pow(2).mean(dim=-1).mean()
+                        if use_mse:
+                            loss, (x, z), _, out = compute_bits_per_dim(x, model)
+                        else:
+                            loss, (x, z), _ = compute_bits_per_dim(x, model)
+                        if use_mse:
+                            batch_size, in_channels, in_height, in_width = x.size()
+                            out_channels = in_channels * (downscale_factor ** 2)
+    
+                            out_height = in_height // downscale_factor
+                            out_width = in_width // downscale_factor
+                            input_view = x.contiguous().view(
+                                batch_size, in_channels, out_height, downscale_factor, out_width, downscale_factor
+                            )
+    
+                            output = input_view.permute(0, 1, 3, 5, 2, 4).contiguous()
+                            output = output.view(batch_size, out_channels, out_height, out_width)
+                            d = output.size(1) // 2
+                            output = output[:, d:]
+    
+                            dist = (output.view(output.size(0), -1) - z).pow(2).mean(dim=-1).mean()
+                        else:
+                            dist = (x.view(x.size(0),-1)-z).pow(2).mean(dim=-1).mean()
                         meandist = i / (i + 1) * dist + meandist / (i + 1)
                         lossmean = i / (i + 1) * lossmean + loss / (i + 1)
 
