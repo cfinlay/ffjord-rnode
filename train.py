@@ -131,7 +131,7 @@ cudnn.benchmark = True
 training_complete_model = True
 training_last_layer = False
 use_mse = not(training_complete_model | training_last_layer)
-block = 0
+block = 100
 downscale_factor = 2
 args = get_parser().parse_args()
 torch.manual_seed(args.seed)

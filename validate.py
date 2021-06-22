@@ -23,12 +23,12 @@ from train_misc import create_regularization_fns, get_regularization, append_reg
 from train_misc import append_regularization_keys_header, append_regularization_csv_dict
 
 from lib.datasets import CelebAHQ, Imagenet64
-
+from celebmaindataset import CelebMainDataset
 # go fast boi!!
 torch.backends.cudnn.benchmark = True
 SOLVERS = ["dopri5", "bdf", "rk4", "midpoint", 'adams', 'explicit_adams', 'adaptive_heun', 'bosh3']
 parser = argparse.ArgumentParser("Continuous Normalizing Flow")
-parser.add_argument("--data", choices=["celebahq", "mnist", "svhn", "cifar10", 'imagenet64'], type=str, default="mnist")
+parser.add_argument("--data", choices=["celebahq", "mnist", "svhn", "cifar10", 'imagenet64'], type=str, default="celebahq")
 parser.add_argument("--dims", type=str, default="64,64,64")
 parser.add_argument("--strides", type=str, default="1,1,1,1")
 parser.add_argument("--num_blocks", type=int, default=2, help='Number of stacked CNFs.')
@@ -75,12 +75,14 @@ parser.add_argument('--directional-penalty', type=float, default=None, help="int
 parser.add_argument("--nrow", type=int, default=8)
 
 parser.add_argument("--chkpt", type=str, default=None, help='path to saved model checkpoint')
-parser.add_argument('--validate', type=eval, default=True, choices=[True, False])
+parser.add_argument('--validate', type=eval, default=False, choices=[True, False])
 parser.add_argument('--generate', type=eval, default=True, choices=[True, False])
 parser.add_argument('--save-real', type=eval, default=True, choices=[True, False])
 
 args = parser.parse_args()
-
+training_complete_model = True
+training_last_layer = False
+use_mse = not(training_complete_model | training_last_layer)
 assert args.chkpt is not None
 
 
@@ -108,46 +110,41 @@ def get_dataset(args):
     if args.data == "mnist":
         im_dim = 1
         im_size = 28 if args.imagesize is None else args.imagesize
-        train_set = dset.MNIST(root="./data", train=True, transform=trans(im_size), download=True)
+        #train_set = dset.MNIST(root="./data", train=True, transform=trans(im_size), download=True)
         test_set = dset.MNIST(root="./data", train=False, transform=trans(im_size), download=True)
     elif args.data == "cifar10":
         im_dim = 3
         im_size = 32 if args.imagesize is None else args.imagesize
-        train_set = dset.CIFAR10(
-            root="./data", train=True, transform=tforms.Compose([
-                tforms.Resize(im_size),
-                tforms.RandomHorizontalFlip(),
-                tforms.ToTensor(),
-            ]), download=True
-        )
+        #train_set = dset.CIFAR10(
+        #    root="./data", train=True, transform=tforms.Compose([
+        #        tforms.Resize(im_size),
+        #        tforms.RandomHorizontalFlip(),
+        #        tforms.ToTensor(),
+        #    ]), download=True
+        #)
         test_set = dset.CIFAR10(root="./data", train=False, transform=trans(im_size), download=True)
     elif args.data == 'imagenet64':
         im_dim = 3
         if args.imagesize != 64:
             args.imagesize = 64
         im_size = 64
-        train_set = Imagenet64(train=True, root='/mnt/data/scratch/data/', transform=tforms.ToTensor())
+        #train_set = Imagenet64(train=True, root='/mnt/data/scratch/data/', transform=tforms.ToTensor())
         test_set = Imagenet64(train=False, root='/mnt/data/scratch/data/', transform=tforms.ToTensor())
     elif args.data == 'celebahq':
+        #im_dim = 3
+        #im_size = 256 if args.imagesize is None else args.imagesize
         im_dim = 3
-        im_size = 256 if args.imagesize is None else args.imagesize
-        train_set = CelebAHQ(
-            train=True, root='/mnt/data/scratch/data/', transform=tforms.Compose([
-                tforms.ToPILImage(),
-                tforms.Resize(im_size),
-                tforms.RandomHorizontalFlip(),
-                tforms.ToTensor()
-            ])
-        )
-        test_set = CelebAHQ(
-            train=False, root='/mnt/data/scratch/data/', transform=tforms.Compose([
-                tforms.ToPILImage(),
-                tforms.Resize(im_size),
-                tforms.ToTensor()
-            ])
-        )
+        im_size = 32
+        #train_set = CelebMainDataset(root="/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/training/", 
+        #                                 transforms=tforms.Compose([tforms.ToPILImage(), tforms.Resize(32), tforms.RandomHorizontalFlip(), tforms.ToTensor()]))
+        test_set = CelebMainDataset(root="/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/test/", transforms=tforms.Compose([
+                             tforms.ToPILImage(),
+                             tforms.Resize(32),
+                             tforms.RandomHorizontalFlip(),
+                             tforms.ToTensor()
+                         ]))
     data_shape = (im_dim, im_size, im_size)
-
+    train_set = []
     test_loader = torch.utils.data.DataLoader(
         dataset=test_set, batch_size=args.test_batch_size, shuffle=False, drop_last=True
     )
@@ -170,6 +167,8 @@ def create_model(args, data_shape, regularization_fns):
         zero_last=args.zero_last,
         alpha=args.alpha,
         cnf_kwargs={"T": args.time_length, "train_T": args.train_T, "regularization_fns": regularization_fns},
+        training_complete_model=training_complete_model,
+        training_last_layer=training_last_layer, validate=True
     )
 
     return model
@@ -182,7 +181,7 @@ if __name__ == "__main__":
     cvt = lambda x: x.type(torch.float32).to(device, non_blocking=True)
 
     # load dataset
-    train_set, test_loader, data_shape = get_dataset(args)
+    _, test_loader, data_shape = get_dataset(args)
 
     # build model
     regularization_fns, regularization_coeffs = create_regularization_fns(args)
