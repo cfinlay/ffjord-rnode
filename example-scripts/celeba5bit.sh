@@ -16,7 +16,7 @@ python -m torch.distributed.launch \
   --datadir $DATADIR \
   --batch_size 64 \
   --test_batch_size 64 \
-  --num_epochs 30 \
+  --num_epochs 16 \
   --save $SAVE \
   --kinetic-energy $KE \
   --jacobian-norm2 $JF \

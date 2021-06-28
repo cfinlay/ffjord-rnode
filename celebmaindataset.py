@@ -40,11 +40,12 @@ class CelebMainDataset(Dataset):
         img_name = os.path.join(self.root_dir,
                                 self.training_files_names[idx])
         image = io.imread(img_name)
+        
+        
         if self.transform:
             image = self.transform(image)
-        
-        image = image.numpy()
-        
+        image = np.array(image)
+        image = np.moveaxis(image, 2, 0)
         return image, np.zeros_like(image)
         
 

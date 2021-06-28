@@ -259,10 +259,11 @@ if __name__ == "__main__":
             save_image(x, fig_filename, nrow=args.nrow)
         if args.generate:
             print('\nGenerating images... ')
-            for t in [1., 0.9, 0.8, 0.7, 0.6, 0.5]:
+            times = np.linspace(1,0.5, 100)
+            for t in times:
                 # visualize samples and density
                 fig_filename = os.path.join(chkdir, "generated-T%g.jpg" % t)
                 utils.makedirs(os.path.dirname(fig_filename))
                 generated_samples = model(t * fixed_z, reverse=True)
                 x = unshift(generated_samples[0].view(-1, *data_shape), 8)
-                save_image(x, fig_filename, nrow=args.nrow)
+                save_image(x*255.0, fig_filename, nrow=args.nrow)

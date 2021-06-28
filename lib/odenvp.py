@@ -34,7 +34,8 @@ class ODENVP(nn.Module):
             cnf_kwargs=None,
             training_complete_model=False,
             training_last_layer=False, 
-            validate = False
+            validate = False,
+            training_benchmark_model = False
     ):
         super(ODENVP, self).__init__()
         if squeeze_first:
@@ -42,7 +43,7 @@ class ODENVP(nn.Module):
             c, w, h = c * 4, w // 2, h // 2
             input_size = bsz, c, w, h
         
-        if training_complete_model | validate:    
+        if training_complete_model | validate | training_benchmark_model:    
             self.n_scale = min(n_scale, self._calc_n_scale(input_size))
         else:
             self.n_scale = 1
@@ -58,11 +59,13 @@ class ODENVP(nn.Module):
         self.alpha = alpha
         self.squeeze_first = squeeze_first
         self.cnf_kwargs = cnf_kwargs if cnf_kwargs else {}
-        self.use_mse = not(training_complete_model | training_last_layer | validate)
+        self.use_mse = not(training_complete_model | training_last_layer | validate | training_benchmark_model)
         if not self.n_scale > 0:
             raise ValueError('Could not compute number of scales for input of' 'size (%d,%d,%d,%d)' % input_size)
         
-        if validate:
+        if training_benchmark_model:
+            self.transforms = self.build_net_for_complete_without_weights(input_size)
+        elif validate:
             self.transforms = self.build_net_for_valiation(input_size)
         elif training_complete_model:
             self.transforms = self.build_net_for_complete(input_size)
@@ -73,12 +76,17 @@ class ODENVP(nn.Module):
         self.dims = [o[1:] for o in self.calc_output_size(input_size)]
         print(self.dims)
 
+    def build_net_for_complete_without_weights(self, input_size):
+         batch, c, h, w = input_size
+         model = self._build_net((batch, c, h, w))
+         return model
+     
     def build_net_for_valiation(self, input_size):
         batch, c, h, w = input_size
         models = []
         skip_index = len("transforms.")
         final_state_dict = {}
-        state_dict = torch.load("/HPS/CNF/work/ffjord-rnode/experiments/celebahq/example/best_100.pth")["state_dict"]
+        state_dict = torch.load("/HPS/CNF/work/ffjord-rnode/experiments/celebahq/example/best_benchmark.pth")["state_dict"]
         for key in state_dict.keys():
             final_state_dict[key[skip_index:]]= state_dict[key]
         
@@ -144,11 +152,16 @@ class ODENVP(nn.Module):
         n, c, h, w = input_size
         output_sizes = []
         for i in range(self.n_scale):
-            if i <= self.n_scale - 1:
+            if i < self.n_scale - 1:
                 c *= 2
                 h //= 2
                 w //= 2
                 output_sizes.append((n, c, h, w))
+            elif i == self.n_scale-1:
+                c *= 2
+                h //= 2
+                w //= 2
+                output_sizes.append((n, c*2, h, w))
             else:
                 output_sizes.append((n, c, h, w))
         return tuple(output_sizes)
@@ -204,16 +217,20 @@ class ODENVP(nn.Module):
 
     def _generate(self, z, logpz=None, reg_states=tuple()):
         z = z.view(z.shape[0], -1)
-        print(z.size())
         zs = []
         i = 0
+        
         for dims in self.dims:
             s = np.prod(dims)
             zs.append(z[:, i:i + s])
             i += s
-        print(zs)
-        zs = [_z.view(_z.size()[0], *zsize) for _z, zsize in zip(zs, self.dims)]
+        length = len(zs)
+        for i in range(length):
+            _z = zs[i]
+            zsize = self.dims[i]
+            zs[i] = _z.view(_z.size()[0], *zsize)
         _logpz = torch.zeros(zs[0].shape[0], 1).to(zs[0]) if logpz is None else logpz
+        
         z_prev, _logpz, _ = self.transforms[-1](zs[-1], _logpz, reverse=True)
         for idx in range(len(self.transforms) - 2, -1, -1):
             z_prev = torch.cat((z_prev, zs[idx]), dim=1)

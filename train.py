@@ -128,10 +128,11 @@ def get_parser():
 
 
 cudnn.benchmark = True
-training_complete_model = True
+training_complete_model = False
 training_last_layer = False
-use_mse = not(training_complete_model | training_last_layer)
-block = 100
+training_benchmark_model = True
+use_mse = not(training_complete_model | training_last_layer | training_benchmark_model)
+block = 100000
 downscale_factor = 2
 args = get_parser().parse_args()
 torch.manual_seed(args.seed)
@@ -219,20 +220,19 @@ def get_dataset(args, device):
         if block == 3:
             im_dim = 24
             im_size = 4
-        if training_complete_model:
+        if training_complete_model | training_benchmark_model:
             im_dim = 3
             im_size = 32
-        if not training_complete_model:
+        if not (training_complete_model | training_benchmark_model):
             train_set = CelebDataset(root="/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/training_sets/" + str(block))
             test_set = CelebDataset(root="/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/test_sets/" + str(block))
         else:
             train_set = CelebMainDataset(root="/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/training/", 
-                                         transforms=tforms.Compose([tforms.ToPILImage(), tforms.Resize(32), tforms.RandomHorizontalFlip(), tforms.ToTensor()]))
+                                         transforms=tforms.Compose([tforms.ToPILImage(), tforms.Resize(32), tforms.RandomHorizontalFlip()]))
             test_set = CelebMainDataset(root="/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/test/", transforms=tforms.Compose([
                                  tforms.ToPILImage(),
                                  tforms.Resize(32),
-                                 tforms.RandomHorizontalFlip(),
-                                 tforms.ToTensor()
+                                 tforms.RandomHorizontalFlip()                                
                              ]))
 
     elif args.data == 'imagenet64':
@@ -337,7 +337,8 @@ def create_model(args, data_shape, regularization_fns):
         alpha=args.alpha,
         cnf_kwargs={"T": args.time_length, "train_T": args.train_T, "regularization_fns": regularization_fns},
         training_complete_model=training_complete_model,
-        training_last_layer=training_last_layer
+        training_last_layer=training_last_layer,
+        training_benchmark_model =training_benchmark_model
     )
     print("model created ...")
     return model
@@ -358,7 +359,8 @@ def create_model_complete(args, data_shape, regularization_fns):
         alpha=args.alpha,
         cnf_kwargs={"T": args.time_length, "train_T": args.train_T, "regularization_fns": regularization_fns},
         training_complete_model=training_complete_model,
-        training_last_layer=training_last_layer
+        training_last_layer=training_last_layer,
+        training_benchmark_model =training_benchmark_model
     )
     print("model created ...")
     return model
@@ -398,7 +400,7 @@ def main():
 
     # build model
     regularization_fns, regularization_coeffs = create_regularization_fns(args)
-    if not training_complete_model:
+    if not( training_complete_model | training_benchmark_model):
         model = create_model(args, data_shape, regularization_fns).cuda()
     else:
         model = create_model_complete(args, data_shape, regularization_fns).cuda()
@@ -670,18 +672,22 @@ def main():
 
                     if loss < best_loss and args.local_rank == 0:
                         best_loss = loss
-                        shutil.copyfile(os.path.join(args.save, "checkpt_" + str(block) + ".pth"),
-                                        os.path.join(args.save, "best_" + str(block) + ".pth"))
+                        if training_benchmark_model:
+                            shutil.copyfile(os.path.join(args.save, "checkpt_" + str(block) + ".pth"),
+                                            os.path.join(args.save, "best_benchmark.pth"))
+                        else:
+                            shutil.copyfile(os.path.join(args.save, "checkpt_" + str(block) + ".pth"),
+                                            os.path.join(args.save, "best_" + str(block) + ".pth"))
 
             # visualize samples and density
-            # if write_log:
-            # with torch.no_grad():
-            # fig_filename = os.path.join(args.save, "figs", "{:04d}.jpg".format(epoch))
-            # utils.makedirs(os.path.dirname(fig_filename))
-            # generated_samples, _, _ = model(fixed_z, reverse=True)
-            # generated_samples = generated_samples.view(-1, *data_shape)
-            # nb = int(np.ceil(np.sqrt(float(fixed_z.size(0)))))
-            # save_image(unshift(generated_samples, nbits=args.nbits), fig_filename, nrow=nb)
+            if write_log:
+                with torch.no_grad():
+                    fig_filename = os.path.join(args.save, "figs", "{:04d}.jpg".format(epoch))
+                    utils.makedirs(os.path.dirname(fig_filename))
+                    generated_samples, _, _ = model(fixed_z, reverse=True)
+                    generated_samples = generated_samples.view(-1, *data_shape)
+                    nb = int(np.ceil(np.sqrt(float(fixed_z.size(0)))))
+                    save_image(unshift(generated_samples, nbits=args.nbits)*255.0, fig_filename, nrow=nb)
             if args.validate:
                 break
 

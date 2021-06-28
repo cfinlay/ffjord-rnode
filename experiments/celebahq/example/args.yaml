@@ -24,7 +24,7 @@ max_grad_norm: .inf
 nbits: 5
 nonlinearity: softplus
 num_blocks: 2
-num_epochs: 30
+num_epochs: 16
 nworkers: 8
 optimizer: adam
 resume: null
