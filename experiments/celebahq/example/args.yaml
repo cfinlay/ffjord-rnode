@@ -1,7 +1,7 @@
 add_noise: true
 alpha: 0.05
 atol: 1.0e-05
-batch_size: 64
+batch_size: 32
 batch_size_schedule: ''
 data: celebahq
 datadir: ../data/
@@ -18,14 +18,14 @@ jacobian_norm2: 0.01
 kinetic_energy: 0.01
 layer_type: concat
 local_rank: 0
-log_freq: 10
+log_freq: 1
 lr: 0.001
 max_grad_norm: .inf
 nbits: 5
 nonlinearity: softplus
 num_blocks: 2
 num_epochs: 16
-nworkers: 8
+nworkers: 4
 optimizer: adam
 resume: null
 rtol: 1.0e-05
@@ -36,7 +36,7 @@ squeeze_first: false
 step_size: 0.25
 strides: 1,1,1,1
 test_atol: 1.0e-05
-test_batch_size: 64
+test_batch_size: 32
 test_first_step: null
 test_rtol: 1.0e-05
 test_solver: dopri5
