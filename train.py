@@ -188,7 +188,7 @@ def get_dataset(args):
         test_set = dset.CIFAR10(root=args.datadir, train=False, transform=None, download=True)
     elif args.data == 'celebahq':
         im_dim = 3
-        im_size = 32 if args.imagesize is None else args.imagesize
+        im_size = 64 if args.imagesize is None else args.imagesize
         train_set = CelebAHQ("/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/training/", transform=tforms.Compose([
             tforms.Resize(im_size),
             tforms.RandomHorizontalFlip(),
