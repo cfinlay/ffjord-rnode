@@ -185,12 +185,12 @@ def get_dataset(args):
     elif args.data == 'celebahq':
         im_dim = 3
         im_size = 32 if args.imagesize is None else args.imagesize
-        train_set = CelebAHQ("/HPS/CNF/work/ffjord-rnode_first_atempt/data/CelebAMask-HQ/training/", transform=tforms.Compose([
+        train_set = CelebAHQ("/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/training/", transform=tforms.Compose([
                 tforms.Resize(im_size),
                 tforms.RandomHorizontalFlip(),
             ])
         )
-        test_set = CelebAHQ("/HPS/CNF/work/ffjord-rnode_first_atempt/data/CelebAMask-HQ/test/",  transform=tforms.Compose([
+        test_set = CelebAHQ("/HPS/CNF/work/ffjord-rnode/data/CelebAMask-HQ/test/",  transform=tforms.Compose([
                 tforms.Resize(im_size),
             ])
         )
