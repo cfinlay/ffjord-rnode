@@ -1,7 +1,7 @@
 add_noise: true
 alpha: 0.05
 atol: 1.0e-05
-batch_size: 32
+batch_size: 16
 batch_size_schedule: ''
 data: celebahq
 datadir: ../data/
@@ -36,7 +36,7 @@ squeeze_first: false
 step_size: 0.25
 strides: 1,1,1,1
 test_atol: 1.0e-05
-test_batch_size: 32
+test_batch_size: 16
 test_first_step: null
 test_rtol: 1.0e-05
 test_solver: dopri5

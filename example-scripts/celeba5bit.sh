@@ -15,8 +15,8 @@ python -m torch.distributed.launch \
   --nbits 5 \
   --log_freq 1 \
   --datadir $DATADIR \
-  --batch_size 32 \
-  --test_batch_size 32 \
+  --batch_size 16 \
+  --test_batch_size 16 \
   --num_epochs 16 \
   --save $SAVE \
   --kinetic-energy $KE \
