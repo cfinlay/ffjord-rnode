@@ -1,4 +1,6 @@
 *__pycache__*
 *.pyc
-data/*
-experiments/*
+data/MNIST
+data/CelebAMask-HQ.zip
+*.idea
+*'..*

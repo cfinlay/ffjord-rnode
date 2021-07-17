@@ -36,6 +36,6 @@ class Imagenet64(torchvision.datasets.ImageFolder):
 class CelebAHQ(Dataset):
 
     def __init__(self, train=True, transform=None, root='./data/'):
-        self.train_loc = os.path.join(root,'celebahq/celeba256_train.pth')
-        self.test_loc = os.path.join(root,'celebahq/celeba256_validation.pth')
+        self.train_loc = root + 'CelebAMask-HQ/training/'
+        self.test_loc = root + 'CelebAMask-HQ/test/'
         return super(CelebAHQ, self).__init__(self.train_loc if train else self.test_loc, transform=transform, in_mem=False)

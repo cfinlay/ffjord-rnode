@@ -10,7 +10,6 @@ class ODENVP(nn.Module):
     """
     Real NVP for image data. Will downsample the input until one of the
     dimensions is less than or equal to 4.
-
     Args:
         input_size (tuple): 4D tuple of the input size.
         n_scale (int): Number of scales for the representation z.
@@ -18,40 +17,39 @@ class ODENVP(nn.Module):
     """
 
     def __init__(
-        self,
-        input_size,
-        n_scale=float('inf'),
-        n_blocks=2,
-        strides=None,
-        intermediate_dims=(32,),
-        nonlinearity="softplus",
-        layer_type="concat",
-        squash_input=True,
-        squeeze_first=False,
-        zero_last=True,
-        div_samples=1,
-        alpha=0.05,
-        cnf_kwargs=None,
+            self,
+            input_size,
+            n_scale=float('inf'),
+            n_blocks=2,
+            strides=None,
+            intermediate_dims=(32,),
+            nonlinearity="softplus",
+            layer_type="concat",
+            squash_input=True,
+            squeeze_first=False,
+            zero_last=True,
+            div_samples=1,
+            alpha=0.05,
+            cnf_kwargs=None,
     ):
         super(ODENVP, self).__init__()
         if squeeze_first:
             bsz, c, w, h = input_size
-            c, w, h = c*4, w//2, h//2
+            c, w, h = c * 4, w // 2, h // 2
             input_size = bsz, c, w, h
 
         self.n_scale = min(n_scale, self._calc_n_scale(input_size))
         self.n_blocks = n_blocks
         self.intermediate_dims = intermediate_dims
-        self.layer_type=layer_type
-        self.zero_last=zero_last
-        self.div_samples=div_samples
+        self.layer_type = layer_type
+        self.zero_last = zero_last
+        self.div_samples = div_samples
         self.nonlinearity = nonlinearity
-        self.strides=strides
+        self.strides = strides
         self.squash_input = squash_input
         self.alpha = alpha
         self.squeeze_first = squeeze_first
         self.cnf_kwargs = cnf_kwargs if cnf_kwargs else {}
-
 
         if not self.n_scale > 0:
             raise ValueError('Could not compute number of scales for input of' 'size (%d,%d,%d,%d)' % input_size)
@@ -82,7 +80,6 @@ class ODENVP(nn.Module):
             )
             c, h, w = c * 2, h // 2, w // 2
         return nn.ModuleList(transforms)
-
 
     def _calc_n_scale(self, input_size):
         _, _, h, w = input_size
@@ -154,25 +151,26 @@ class ODENVP(nn.Module):
 
 class StackedCNFLayers(layers.SequentialFlow):
     def __init__(
-        self,
-        initial_size,
-        idims=(32,),
-        nonlinearity="softplus",
-        layer_type="concat",
-        div_samples=1,
-        squeeze=True,
-        init_layer=None,
-        n_blocks=1,
-        zero_last=True,
-        strides=None,
-        cnf_kwargs={},
+            self,
+            initial_size,
+            idims=(32,),
+            nonlinearity="softplus",
+            layer_type="concat",
+            div_samples=1,
+            squeeze=True,
+            init_layer=None,
+            n_blocks=1,
+            zero_last=True,
+            strides=None,
+            cnf_kwargs={},
     ):
         chain = []
         if init_layer is not None:
             chain.append(init_layer)
 
         def _make_odefunc(size):
-            net = ODEnet(idims, size, strides, True, layer_type=layer_type, nonlinearity=nonlinearity, zero_last_weight=zero_last)
+            net = ODEnet(idims, size, strides, True, layer_type=layer_type, nonlinearity=nonlinearity,
+                         zero_last_weight=zero_last)
             f = layers.ODEfunc(net, div_samples=div_samples)
             return f
 

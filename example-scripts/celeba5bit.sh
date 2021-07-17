@@ -15,11 +15,12 @@ python -m torch.distributed.launch \
   --nbits 5 \
   --log_freq 1 \
   --datadir $DATADIR \
-  --batch_size 3 \
-  --test_batch_size 3 \
+  --batch_size 16 \
+  --test_batch_size 16 \
   --num_epochs 16 \
   --save $SAVE \
   --kinetic-energy $KE \
   --jacobian-norm2 $JF \
   --alpha 0.05 \
+  --solver "rk4" \
   --test_solver dopri5 --test_atol 1e-5 --test_rtol 1e-5 \
